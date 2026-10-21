@@ -28,7 +28,7 @@ fi
 chmod +x "${SCRIPT_DIR}/rclone+"
 ln -sf "${SCRIPT_DIR}/rclone+" "${TARGET_FILE}"
 
-# Install mc-rclone CLI to ~/.local/bin
+# Install mc-rclone utility to ~/.local/bin/mc-rclone (does not touch system mc)
 mkdir -p "${HOME}/.local/bin"
 chmod +x "${SCRIPT_DIR}/mc-rclone"
 ln -sf "${SCRIPT_DIR}/mc-rclone" "${HOME}/.local/bin/mc-rclone"
@@ -37,11 +37,15 @@ ln -sf "${SCRIPT_DIR}/mc-rclone" "${HOME}/.local/bin/mc-rclone"
 "${SCRIPT_DIR}/mc-rclone" sync
 
 echo "==> Successfully installed:"
-echo "    - CLI manager: ${HOME}/.local/bin/mc-rclone"
-echo "    - ExtFS helper: ${TARGET_FILE}"
+echo "    - Rclone manager: ${HOME}/.local/bin/mc-rclone"
+echo "    - ExtFS helper:   ${TARGET_FILE}"
 echo ""
 echo "How to use:"
-echo "  1. Launch via CLI menu: mc-rclone"
-echo "  2. Or start a remote:   mc-rclone start <remote_name>"
-echo "  3. In MC: connect via Hotlist (Ctrl+\\) or Quick CD: ftp://127.0.0.1:<port>/"
+echo "  - In Midnight Commander (mc):"
+echo "    Press Ctrl+\\ (Directory Hotlist) to connect to any cloud remote."
+echo "  - To start/stop background servers:"
+echo "    mc-rclone start    # starts local listeners"
+echo "    mc-rclone stop     # stops all servers"
+echo "    mc-rclone status   # shows running status"
+
 
