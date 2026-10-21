@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""
+rclone+ - External Virtual File System (extfs) helper for GNU Midnight Commander
+Enables transparent browsing, copying, and managing of Rclone remotes inside MC.
+
+Part of mc-rclone: https://github.com/capimichi/mc-rclone
+License: GNU General Public License v3.0 (GPL-3.0)
+"""
+
+import sys
+import os
+import json
+import shutil
+import subprocess
+import datetime
+import getpass
+import signal
+from concurrent.futures import ThreadPoolExecutor
+
+# Ignore SIGPIPE quietly if stdout is closed early (e.g. piped to head)
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except Exception:
+    pass
+
+import configparser
+
+# Configuration & Defaults
+CONFIG_FILE = os.path.expanduser("~/.config/mc/rclone.ini")
+
+def load_config():
+    cfg = {
+        "max_depth": int(os.getenv("MC_RCLONE_MAX_DEPTH", "3")),
+        "cache_ttl": int(os.getenv("MC_RCLONE_CACHE_TTL", "300")),
+        "timeout": int(os.getenv("MC_RCLONE_TIMEOUT", "6")),
+        "remotes": os.getenv("MC_RCLONE_REMOTES", "").strip(),
+        "debug": os.getenv("MC_RCLONE_DEBUG", "0") == "1",
+    }
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            parser = configparser.ConfigParser()
+            parser.read(CONFIG_FILE)
+            if "rclone" in parser:
+                sec = parser["rclone"]
+                if "max_depth" in sec:
+                    cfg["max_depth"] = sec.getint("max_depth")
+                if "cache_ttl" in sec:
+                    cfg["cache_ttl"] = sec.getint("cache_ttl")
+                if "timeout" in sec:
+                    cfg["timeout"] = sec.getint("timeout")
+                if "remotes" in sec:
+                    cfg["remotes"] = sec.get("remotes").strip()
+                if "debug" in sec:
+                    cfg["debug"] = sec.getboolean("debug")
+        except Exception:
+            pass
+    return cfg
+
+CONFIG = load_config()
+DEFAULT_MAX_DEPTH = CONFIG["max_depth"]
+CACHE_TTL = CONFIG["cache_ttl"]
+RCLONE_TIMEOUT = CONFIG["timeout"]
+DEBUG = CONFIG["debug"]
+LOGFILE = os.getenv("MC_RCLONE_LOGFILE", "/tmp/mc-rclone.log")
+
+# Determine User & Group
+USER = os.getenv("USER") or getpass.getuser() or "0"
+GROUP = os.getenv("GROUP") or "0"
+
+# Find rclone executable
+RCLONE_BIN = shutil.which("rclone")
+if not RCLONE_BIN:
+    for fallback in ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]:
+        if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
+            RCLONE_BIN = fallback
+            break
+
+# Cache directory: ~/.cache/mc/rclone/
+CACHE_DIR = os.path.expanduser("~/.cache/mc/rclone")
+
+
+def log(msg: str):
+    if DEBUG:
+        try:
+            with open(LOGFILE, "a") as f:
+                f.write(f"[{datetime.datetime.now().isoformat()}] {msg}\n")
+        except Exception:
+            pass
+
+
+def ensure_cache_dir():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def run_cmd(args, timeout=60):
+    log(f"run_cmd: {args}")
+    env = os.environ.copy()
+    if "HOME" not in env or not env["HOME"]:
+        env["HOME"] = os.path.expanduser("~")
+
+    class CmdResult:
+        def __init__(self, returncode, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    try:
+        res = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+        return CmdResult(res.returncode, res.stdout, res.stderr)
+    except subprocess.TimeoutExpired:
+        log(f"Command timed out ({timeout}s): {args}")
+        return CmdResult(-1, "", f"Timeout expired after {timeout}s")
+    except Exception as e:
+        log(f"Command error ({args}): {e}")
+        return CmdResult(-1, "", str(e))
+
+
+def format_date(dt_str: str) -> str:
+    """Format ISO 8601 date string to standard ls -l format."""
+    try:
+        # e.g. 2025-03-20T17:21:35.138Z
+        clean_str = dt_str.replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(clean_str)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        diff = (now - dt).total_seconds()
+        # If within 6 months: "Mon DD HH:MM", else "Mon DD  YYYY"
+        if 0 <= diff < 180 * 86400:
+            return dt.strftime("%b %e %H:%M")
+        else:
+            return dt.strftime("%b %e  %Y")
+    except Exception:
+        return datetime.datetime.now().strftime("%b %e %H:%M")
+
+
+def parse_path(full_path: str):
+    """
+    Split storedfilename into (remote, subpath).
+    Example: 'googledrive-capimichi/LAVORO/file.txt' -> ('googledrive-capimichi', 'LAVORO/file.txt')
+             'googledrive-capimichi' -> ('googledrive-capimichi', '')
+    """
+    clean = full_path.strip("/")
+    if "/" in clean:
+        remote, subpath = clean.split("/", 1)
+        return remote, subpath
+    return clean, ""
+
+
+def get_remotes():
+    """Return list of rclone remotes without trailing colons."""
+    if CONFIG["remotes"]:
+        # User specified explicit remotes in config or env
+        return [r.strip() for r in CONFIG["remotes"].split(",") if r.strip()]
+
+    if not RCLONE_BIN:
+        return []
+    res = run_cmd([RCLONE_BIN, "listremotes"], timeout=RCLONE_TIMEOUT)
+    if res.returncode != 0:
+        log(f"Failed to list remotes: {res.stderr}")
+        return []
+    remotes = []
+    for line in res.stdout.strip().splitlines():
+        line = line.strip()
+        if line.endswith(":"):
+            remotes.append(line[:-1])
+        elif line:
+            remotes.append(line)
+    return remotes
+
+
+def fetch_remote_tree(remote: str, max_depth: int):
+    """Fetch file/folder list for a single remote using rclone lsjson with caching."""
+    cache_file = os.path.join(CACHE_DIR, f"{remote}.json")
+    now = datetime.datetime.now().timestamp()
+
+    # Check cache
+    if os.path.isfile(cache_file):
+        try:
+            mtime = os.path.getmtime(cache_file)
+            if now - mtime < CACHE_TTL:
+                with open(cache_file, "r") as f:
+                    return json.load(f)
+        except Exception as e:
+            log(f"Cache read error for {remote}: {e}")
+
+    # Fetch from rclone
+    cmd = [
+        RCLONE_BIN,
+        "lsjson",
+        f"--max-depth={max_depth}",
+        f"--contimeout={RCLONE_TIMEOUT}s",
+        f"--timeout={RCLONE_TIMEOUT}s",
+        f"{remote}:",
+    ]
+    res = run_cmd(cmd, timeout=RCLONE_TIMEOUT + 2)
+    ensure_cache_dir()
+
+    if res.returncode != 0:
+        log(f"lsjson error for {remote}: {res.stderr}")
+        # Cache empty list on error to prevent re-querying dead host on every click
+        try:
+            with open(cache_file, "w") as f:
+                json.dump([], f)
+        except Exception:
+            pass
+        return []
+
+    try:
+        data = json.loads(res.stdout)
+        # Write cache
+        with open(cache_file, "w") as f:
+            json.dump(data, f)
+        return data
+    except Exception as e:
+        log(f"JSON parse error for {remote}: {e}")
+        return []
+
+
+def invalidate_cache(remote: str):
+    cache_file = os.path.join(CACHE_DIR, f"{remote}.json")
+    if os.path.isfile(cache_file):
+        try:
+            os.remove(cache_file)
+            log(f"Invalidated cache for {remote}")
+        except Exception:
+            pass
+
+
+def cmd_list():
+    """List remotes and items inside remotes for Midnight Commander."""
+    remotes = get_remotes()
+    now_date = datetime.datetime.now().strftime("%b %e %H:%M")
+
+    # Fetch trees in parallel across remotes
+    remote_data = {}
+    with ThreadPoolExecutor(max_workers=min(len(remotes) or 1, 8)) as executor:
+        future_to_remote = {
+            executor.submit(fetch_remote_tree, r, DEFAULT_MAX_DEPTH): r
+            for r in remotes
+        }
+        for future in future_to_remote:
+            r = future_to_remote[future]
+            try:
+                remote_data[r] = future.result()
+            except Exception as e:
+                log(f"Failed to fetch {r}: {e}")
+                remote_data[r] = []
+
+    # Output to stdout in MC extfs format:
+    # AAAAAAA NNN OOOOOOOO GGGGGGGG SSSSSSSS DATETIME FILENAME
+    for r in sorted(remotes):
+        # 1. Output the remote itself as a root-level directory
+        sys.stdout.write(f"drwxr-xr-x 1 {USER} {GROUP} 0 {now_date} {r}\n")
+
+        # 2. Output files and directories inside this remote
+        items = remote_data.get(r, [])
+        for item in items:
+            path = item.get("Path")
+            if not path:
+                continue
+
+            full_path = f"{r}/{path}"
+            is_dir = item.get("IsDir", False)
+            raw_size = item.get("Size", 0)
+            size = max(0, raw_size) if raw_size is not None else 0
+            mod_time = format_date(item.get("ModTime", ""))
+            perms = "drwxr-xr-x" if is_dir else "-rw-r--r--"
+
+            sys.stdout.write(f"{perms} 1 {USER} {GROUP} {size} {mod_time} {full_path}\n")
+
+    sys.stdout.flush()
+
+
+def cmd_copyout(storedfilename, extractto):
+    """Download file from rclone remote to local file."""
+    remote, rpath = parse_path(storedfilename)
+    if not remote or not rpath:
+        sys.exit(1)
+    res = run_cmd([RCLONE_BIN, "copyto", f"{remote}:{rpath}", extractto])
+    sys.exit(res.returncode)
+
+
+def cmd_copyin(storedfilename, sourcefile):
+    """Upload local file to rclone remote."""
+    remote, rpath = parse_path(storedfilename)
+    if not remote or not rpath:
+        sys.exit(1)
+    res = run_cmd([RCLONE_BIN, "copyto", sourcefile, f"{remote}:{rpath}"])
+    invalidate_cache(remote)
+    sys.exit(res.returncode)
+
+
+def cmd_rm(storedfilename):
+    """Delete a file from rclone remote."""
+    remote, rpath = parse_path(storedfilename)
+    if not remote or not rpath:
+        sys.exit(1)
+    res = run_cmd([RCLONE_BIN, "deletefile", f"{remote}:{rpath}"])
+    invalidate_cache(remote)
+    sys.exit(res.returncode)
+
+
+def cmd_mkdir(dirname):
+    """Create directory on rclone remote."""
+    remote, rpath = parse_path(dirname)
+    if not remote:
+        sys.exit(1)
+    if not rpath:
+        # Trying to create a new remote from MC is not supported directly
+        sys.exit(1)
+    res = run_cmd([RCLONE_BIN, "mkdir", f"{remote}:{rpath}"])
+    invalidate_cache(remote)
+    sys.exit(res.returncode)
+
+
+def cmd_rmdir(dirname):
+    """Delete directory on rclone remote."""
+    remote, rpath = parse_path(dirname)
+    if not remote or not rpath:
+        sys.exit(1)
+    res = run_cmd([RCLONE_BIN, "rmdir", f"{remote}:{rpath}"])
+    invalidate_cache(remote)
+    sys.exit(res.returncode)
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write("Usage: rclone+ <command> [args...]\n")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    log(f"Invoked cmd: {cmd}, args: {args}")
+
+    if cmd == "list":
+        cmd_list()
+    elif cmd == "copyout":
+        # args: [archivename, storedfilename, extractto]
+        if len(args) >= 3:
+            cmd_copyout(args[1], args[2])
+        elif len(args) == 2:
+            cmd_copyout(args[0], args[1])
+        else:
+            sys.exit(1)
+    elif cmd == "copyin":
+        # args: [archivename, storedfilename, sourcefile]
+        if len(args) >= 3:
+            cmd_copyin(args[1], args[2])
+        elif len(args) == 2:
+            cmd_copyin(args[0], args[1])
+        else:
+            sys.exit(1)
+    elif cmd == "rm":
+        # args: [archivename, storedfilename]
+        target = args[1] if len(args) >= 2 else args[0]
+        cmd_rm(target)
+    elif cmd == "mkdir":
+        # args: [archivename, dirname]
+        target = args[1] if len(args) >= 2 else args[0]
+        cmd_mkdir(target)
+    elif cmd == "rmdir":
+        # args: [archivename, dirname]
+        target = args[1] if len(args) >= 2 else args[0]
+        cmd_rmdir(target)
+    else:
+        log(f"Unknown or unsupported command: {cmd}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
