@@ -333,6 +333,9 @@ def cmd_rmdir(dirname):
 
 
 def main():
+    with open("/tmp/rclone_argv.log", "a") as f:
+        f.write(f"[{datetime.datetime.now()}] argv={sys.argv} pwd={os.getcwd()}\n")
+
     if len(sys.argv) < 2:
         sys.stderr.write("Usage: rclone+ <command> [args...]\n")
         sys.exit(1)

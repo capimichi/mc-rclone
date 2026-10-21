@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+mc-rclone - High-performance on-demand Rclone manager for GNU Midnight Commander.
+
+Runs isolated, lightweight FTP servers on localhost per remote on-demand.
+Allows browsing cloud storages with millions of files at native speeds in MC,
+with support for left/right dual-cloud panels, cloud-to-cloud copying, and
+multiple MC sessions.
+
+Part of mc-rclone: https://github.com/capimichi/mc-rclone
+License: GNU General Public License v3.0 (GPL-3.0)
+"""
+
+import sys
+import os
+import json
+import shutil
+import socket
+import subprocess
+import time
+import signal
+
+BASE_PORT = 2121
+STATE_FILE = os.path.expanduser("~/.cache/mc/rclone/daemons.json")
+HOTLIST_FILE = os.path.expanduser("~/.config/mc/hotlist")
+
+# Find rclone executable
+RCLONE_BIN = shutil.which("rclone")
+if not RCLONE_BIN:
+    for fallback in ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]:
+        if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
+            RCLONE_BIN = fallback
+            break
+
+
+def get_remotes():
+    """Return sorted list of configured rclone remotes."""
+    if not RCLONE_BIN:
+        return []
+    env = os.environ.copy()
+    if "HOME" not in env or not env["HOME"]:
+        env["HOME"] = os.path.expanduser("~")
+    res = subprocess.run([RCLONE_BIN, "listremotes"], capture_output=True, text=True, env=env)
+    if res.returncode != 0:
+        return []
+    remotes = []
+    for line in res.stdout.strip().splitlines():
+        line = line.strip()
+        if line.endswith(":"):
+            remotes.append(line[:-1])
+        elif line:
+            remotes.append(line)
+    return sorted(remotes)
+
+
+def get_port_for_remote(remote: str) -> int:
+    """Return a deterministic port for a given remote name."""
+    remotes = get_remotes()
+    if remote in remotes:
+        return BASE_PORT + remotes.index(remote)
+    # Fallback to hash
+    return BASE_PORT + (abs(hash(remote)) % 100)
+
+
+def load_state():
+    if os.path.isfile(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def is_port_open(port: int) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", port))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def start_server(remote: str) -> int:
+    """Start FTP server for remote if not already running. Return port."""
+    state = load_state()
+    port = get_port_for_remote(remote)
+
+    # Check if already active
+    if remote in state:
+        info = state[remote]
+        pid = info.get("pid")
+        if pid and is_pid_alive(pid) and is_port_open(port):
+            return port
+
+    # Launch rclone serve ftp
+    env = os.environ.copy()
+    if "HOME" not in env or not env["HOME"]:
+        env["HOME"] = os.path.expanduser("~")
+
+    cmd = [
+        RCLONE_BIN,
+        "serve",
+        "ftp",
+        f"{remote}:",
+        "--addr",
+        f"127.0.0.1:{port}",
+        "--vfs-cache-mode",
+        "writes",
+    ]
+
+    log_dir = os.path.expanduser("~/.cache/mc/rclone/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = open(os.path.join(log_dir, f"{remote}.log"), "a")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=env,
+        start_new_session=True,
+    )
+
+    # Wait up to 3 seconds for port to open
+    start_time = time.time()
+    while time.time() - start_time < 3.0:
+        if is_port_open(port):
+            break
+        time.sleep(0.1)
+
+    state[remote] = {
+        "pid": proc.pid,
+        "port": port,
+        "started_at": datetime_now_str(),
+    }
+    save_state(state)
+    return port
+
+
+def stop_server(remote: str):
+    """Stop server for a remote."""
+    state = load_state()
+    if remote in state:
+        pid = state[remote].get("pid")
+        if pid and is_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.2)
+                if is_pid_alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+        del state[remote]
+        save_state(state)
+        print(f"Stopped server for: {remote}")
+    else:
+        print(f"No active server for: {remote}")
+
+
+def stop_all_servers():
+    """Stop all running rclone servers."""
+    state = load_state()
+    for remote, info in list(state.items()):
+        pid = info.get("pid")
+        if pid and is_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+    save_state({})
+    print("Stopped all rclone servers.")
+
+
+def datetime_now_str():
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def sync_hotlist():
+    """Sync Midnight Commander hotlist with all configured rclone remotes."""
+    remotes = get_remotes()
+    if not remotes:
+        print("No rclone remotes found.")
+        return
+
+    os.makedirs(os.path.dirname(HOTLIST_FILE), exist_ok=True)
+    existing_entries = []
+    if os.path.isfile(HOTLIST_FILE):
+        with open(HOTLIST_FILE, "r") as f:
+            for line in f:
+                if "URL \"ftp://127.0.0.1:" not in line and "Rclone:" not in line:
+                    existing_entries.append(line.rstrip("\n"))
+
+    # Append Rclone entries
+    rclone_entries = []
+    for r in remotes:
+        port = get_port_for_remote(r)
+        rclone_entries.append(f'ENTRY "Cloud: {r}" URL "ftp://127.0.0.1:{port}/"')
+
+    with open(HOTLIST_FILE, "w") as f:
+        for entry in rclone_entries:
+            f.write(entry + "\n")
+        for entry in existing_entries:
+            if entry.strip():
+                f.write(entry + "\n")
+
+    print(f"Updated MC hotlist ({HOTLIST_FILE}) with {len(remotes)} cloud remotes.")
+
+
+def cmd_status():
+    """Display status of all servers."""
+    remotes = get_remotes()
+    state = load_state()
+
+    print(f"\n{'REMOTE':<30} {'PORT':<8} {'PID':<8} {'STATUS':<10}")
+    print("-" * 60)
+    for r in remotes:
+        port = get_port_for_remote(r)
+        info = state.get(r, {})
+        pid = info.get("pid")
+        running = pid and is_pid_alive(pid) and is_port_open(port)
+        status_str = "\033[92mRUNNING\033[0m" if running else "\033[90mSTOPPED\033[0m"
+        pid_str = str(pid) if running else "-"
+        print(f"{r:<30} {port:<8} {pid_str:<8} {status_str}")
+    print()
+
+
+def interactive_menu():
+    """Interactive CLI menu to select and launch a remote in MC."""
+    remotes = get_remotes()
+    if not remotes:
+        print("No rclone remotes configured. Run 'rclone config' first.")
+        return
+
+    print("\n\033[1m=== mc-rclone: Cloud Manager for Midnight Commander ===\033[0m\n")
+    state = load_state()
+    for idx, r in enumerate(remotes, 1):
+        port = get_port_for_remote(r)
+        info = state.get(r, {})
+        pid = info.get("pid")
+        running = pid and is_pid_alive(pid) and is_port_open(port)
+        status = "\033[92m●\033[0m" if running else "\033[90m○\033[0m"
+        print(f"  [{idx}] {status} {r} (port {port})")
+
+    print("\n  [s] Sync Hotlist (Ctrl+\\ bookmarks)")
+    print("  [x] Stop all servers")
+    print("  [q] Quit\n")
+
+    try:
+        choice = input("Select an option [1-{}] or command: ".format(len(remotes))).strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+
+    if choice.lower() == "q":
+        return
+    elif choice.lower() == "s":
+        sync_hotlist()
+        return
+    elif choice.lower() == "x":
+        stop_all_servers()
+        return
+
+    try:
+        idx = int(choice)
+        if 1 <= idx <= len(remotes):
+            selected = remotes[idx - 1]
+            print(f"Connecting to {selected}...")
+            port = start_server(selected)
+            url = f"ftp://127.0.0.1:{port}/"
+            print(f"Server ready at: {url}")
+            print(f"Launching Midnight Commander...")
+            time.sleep(0.3)
+            os.execvp("mc", ["mc", url])
+        else:
+            print("Invalid selection.")
+    except ValueError:
+        print("Invalid input.")
+
+
+def main():
+    if len(sys.argv) < 2:
+        interactive_menu()
+        return
+
+    sub = sys.argv[1].lower()
+
+    if sub in ["start", "serve"]:
+        if len(sys.argv) < 3:
+            print("Usage: mc-rclone start <remote_name>")
+            sys.exit(1)
+        remote = sys.argv[2]
+        port = start_server(remote)
+        print(f"Started server for {remote} on port {port}: ftp://127.0.0.1:{port}/")
+    elif sub == "stop":
+        if len(sys.argv) >= 3:
+            stop_server(sys.argv[2])
+        else:
+            stop_all_servers()
+    elif sub in ["status", "list"]:
+        cmd_status()
+    elif sub in ["sync", "sync-hotlist"]:
+        sync_hotlist()
+    elif sub == "connect":
+        if len(sys.argv) < 3:
+            interactive_menu()
+        else:
+            remote = sys.argv[2]
+            port = start_server(remote)
+            url = f"ftp://127.0.0.1:{port}/"
+            os.execvp("mc", ["mc", url])
+    else:
+        print("Usage: mc-rclone [connect|start|stop|status|sync]")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

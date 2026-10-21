@@ -28,10 +28,20 @@ fi
 chmod +x "${SCRIPT_DIR}/rclone+"
 ln -sf "${SCRIPT_DIR}/rclone+" "${TARGET_FILE}"
 
-echo "==> Successfully installed to: ${TARGET_FILE}"
+# Install mc-rclone CLI to ~/.local/bin
+mkdir -p "${HOME}/.local/bin"
+chmod +x "${SCRIPT_DIR}/mc-rclone"
+ln -sf "${SCRIPT_DIR}/mc-rclone" "${HOME}/.local/bin/mc-rclone"
+
+# Sync hotlist bookmarks
+"${SCRIPT_DIR}/mc-rclone" sync
+
+echo "==> Successfully installed:"
+echo "    - CLI manager: ${HOME}/.local/bin/mc-rclone"
+echo "    - ExtFS helper: ${TARGET_FILE}"
 echo ""
-echo "How to use in Midnight Commander:"
-echo "  1. Open Midnight Commander: mc"
-echo "  2. Press Alt+C (Quick cd)"
-echo "  3. Type: rclone:// and press Enter"
-echo "  4. Browse and manage your cloud files transparently!"
+echo "How to use:"
+echo "  1. Launch via CLI menu: mc-rclone"
+echo "  2. Or start a remote:   mc-rclone start <remote_name>"
+echo "  3. In MC: connect via Hotlist (Ctrl+\\) or Quick CD: ftp://127.0.0.1:<port>/"
+

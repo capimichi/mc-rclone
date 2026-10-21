@@ -8,12 +8,11 @@ Browse, copy, move, view, and manage files on any cloud storage supported by Rcl
 
 ## ✨ Features
 
-- **Native VFS integration**: Uses Midnight Commander's built-in `extfs` subsystem.
-- **Zero runtime dependencies**: Pure Python 3 standard library (no pip packages or virtualenvs needed).
-- **Multi-remote support**: Automatically detects all remotes configured in your `rclone.conf`.
-- **Parallel scanning & smart caching**: Uses thread pools to fetch directory trees concurrently and caches results locally in `~/.cache/mc/rclone/` for lightning-fast navigation (< 0.1s).
-- **Resilient & fault-tolerant**: Handles offline or unreachable remotes gracefully with per-remote timeouts without blocking other remotes.
-- **Full file operations**: Supports viewing, copying in/out, renaming, deleting, and directory creation.
+- **Blazing Fast On-Demand Navigation**: Operates on-demand directory-by-directory. Handles cloud remotes with millions of files without freezing, memory leaks, or pre-crawling.
+- **Dual-Pane Cloud-to-Cloud Transfers**: Mount Google Drive on the left panel and Dropbox on the right panel, and copy files directly between clouds with `F5`.
+- **Zero FUSE Required**: Uses pure local networking on `127.0.0.1`. Works on macOS, Linux, and BSD without kernel extensions (`macFUSE`) or root permissions.
+- **Multi-Session & Isolated**: Multiple MC panels and tmux windows can connect to the same remote concurrently. If one remote server goes offline, it never affects the others.
+- **Automatic Lifecycle Management**: Start and stop remote servers cleanly via the `mc-rclone` CLI or auto-sync your Midnight Commander Directory Hotlist (`Ctrl+\`).
 
 ---
 
@@ -22,7 +21,7 @@ Browse, copy, move, view, and manage files on any cloud storage supported by Rcl
 ### 1. Requirements
 
 - [GNU Midnight Commander](https://midnight-commander.org/) (`mc`)
-- [Rclone](https://rclone.org/) configured with at least one remote (`rclone config`)
+- [Rclone](https://rclone.org/) configured with your remotes (`rclone config`)
 - Python 3.7+
 
 ### 2. Installation
@@ -35,21 +34,70 @@ cd mc-rclone
 ./install.sh
 ```
 
-*(This creates a symlink to `rclone+` inside `~/.local/share/mc/extfs.d/`)*.
+---
 
-### 3. Usage
+## 🖥️ Usage
 
-1. Open Midnight Commander:
-   ```bash
-   mc
-   ```
-2. Press **`Alt + C`** (or `Esc` followed by `c`) to open the **Quick cd** dialog.
-3. Type:
-   ```text
-   rclone://
-   ```
-   and press **Enter**.
-4. You will see all your configured Rclone remotes as top-level folders. Navigate into any remote to view and manage your files!
+### Mode A: Interactive Selector (Recommended)
+
+Simply run:
+
+```bash
+mc-rclone
+```
+
+It displays an interactive menu with all your configured Rclone remotes and their live status:
+
+```text
+=== mc-rclone: Cloud Manager for Midnight Commander ===
+
+  [1] ○ dropbox-michele (port 2121)
+  [2] ● googledrive-capimichi (port 2122)
+  [3] ○ home (port 2123)
+
+  [s] Sync Hotlist (Ctrl+\ bookmarks)
+  [x] Stop all servers
+  [q] Quit
+
+Select an option [1-3] or command:
+```
+
+Select a remote number (e.g. `2`), and it starts the server and launches Midnight Commander directly inside that remote!
+
+### Mode B: Dual-Panel / Cloud-to-Cloud Copying
+
+Start the remotes you need:
+
+```bash
+mc-rclone start googledrive-capimichi   # Running on port 2122
+mc-rclone start dropbox-michele         # Running on port 2121
+```
+
+Then open Midnight Commander with Google Drive on the left and Dropbox on the right:
+
+```bash
+mc ftp://127.0.0.1:2122/ ftp://127.0.0.1:2121/
+```
+
+Press **`F5`** to copy files directly between clouds!
+
+### Mode C: Inside Midnight Commander (Hotlist / Bookmarks)
+
+Press **`Ctrl + \`** (Directory Hotlist) inside Midnight Commander:
+Select any `Cloud: <remote>` entry and press **Enter** to jump straight into that cloud storage.
+
+---
+
+## 🛠️ CLI Reference
+
+| Command | Description |
+| :--- | :--- |
+| `mc-rclone` | Open the interactive menu |
+| `mc-rclone status` | Show all remotes, ports, PIDs, and running status |
+| `mc-rclone start <remote>` | Start local server for a specific remote |
+| `mc-rclone stop [remote]` | Stop a specific remote or all servers |
+| `mc-rclone sync` | Update MC Hotlist (`Ctrl+\`) with all remotes |
+
 
 ---
 
