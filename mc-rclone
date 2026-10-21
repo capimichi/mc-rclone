@@ -115,11 +115,11 @@ def sync_hotlist(silent=False):
                 if "URL \"ftp://127.0.0.1:" not in line and 'ENTRY "Cloud:' not in line:
                     existing_entries.append(line.rstrip("\n"))
 
-    # Generate fresh Cloud: entries
+    # Generate fresh Cloud: entries (VFS URLs in MC hotlist require leading slash: /ftp://...)
     rclone_entries = []
     for r in remotes:
         port = get_port_for_remote(r, remotes)
-        rclone_entries.append(f'ENTRY "Cloud: {r}" URL "ftp://127.0.0.1:{port}/"')
+        rclone_entries.append(f'ENTRY "Cloud: {r}" URL "/ftp://127.0.0.1:{port}/"')
 
     with open(HOTLIST_FILE, "w") as f:
         for entry in rclone_entries:
