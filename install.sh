@@ -36,16 +36,21 @@ ln -sf "${SCRIPT_DIR}/mc-rclone" "${HOME}/.local/bin/mc-rclone"
 # Sync hotlist bookmarks
 "${SCRIPT_DIR}/mc-rclone" sync
 
+# Enable macOS background service so it is always ready on-demand
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    "${SCRIPT_DIR}/mc-rclone" service-install
+fi
+
 echo "==> Successfully installed:"
 echo "    - Rclone manager: ${HOME}/.local/bin/mc-rclone"
 echo "    - ExtFS helper:   ${TARGET_FILE}"
 echo ""
 echo "How to use:"
 echo "  - In Midnight Commander (mc):"
-echo "    Press Ctrl+\\ (Directory Hotlist) to connect to any cloud remote."
-echo "  - To start/stop background servers:"
-echo "    mc-rclone start    # starts local listeners"
-echo "    mc-rclone stop     # stops all servers"
-echo "    mc-rclone status   # shows running status"
+echo "    Press Ctrl+\\ (Directory Hotlist) to connect to any cloud remote on-demand."
+echo "  - Daemon / Service management:"
+echo "    mc-rclone status              # shows service & remote status"
+echo "    mc-rclone service-install     # enable auto-start on macOS login"
+echo "    mc-rclone service-uninstall   # disable auto-start on macOS login"
 
 
