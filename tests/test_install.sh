@@ -12,10 +12,9 @@ test -x "$HOME/.local/share/mc/scripts/mc-rclone-bridge"
 
 # Verify menu contains shortcut
 grep -q "mc-rclone-bridge start" "$HOME/.config/mc/menu"
-grep -q "%cd ftp://127.0.0.1:2123/" "$HOME/.config/mc/menu"
 
 # Verify hotlist contains entry
-grep -q "ftp://127.0.0.1:2123/" "$HOME/.config/mc/hotlist"
+grep -q "ftp://127.0.0.1:2123" "$HOME/.config/mc/hotlist"
 
 echo "Install verification passed."
 

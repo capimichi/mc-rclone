@@ -47,19 +47,26 @@ What `install.sh` does:
 
 ### Inside Midnight Commander
 
-1. Launch standard Midnight Commander:
+1. **Launch standard Midnight Commander:**
    ```bash
    mc
    ```
-2. Press **`F2`** (User Menu) and press **`R`** (*Cloud Storage (Rclone All Remotes)*).
-   - In under 0.5s, the bridge activates and switches your panel to `ftp://127.0.0.1:2123/`.
-3. You will see all your configured Rclone cloud remotes as top-level directories:
-   - `dropbox-michele/`
-   - `googledrive-capimichi/`
-   - `home/`
-   - ...
-4. Press **Enter** on any remote to browse files and folders live on-demand.
-5. When you exit Midnight Commander (`F10`), the bridge automatically shuts down with zero lingering background processes.
+2. **Start Cloud Server (F2 -> R):**
+   * Press **`F2`** (User Menu), then press **`R`** (*Start Cloud Storage (Rclone Server)*).
+   * The local Rclone bridge starts in background (~0.2s) listening on `127.0.0.1:2123`.
+3. **Browse Cloud Remotes (Ctrl + \\):**
+   * Press **`Ctrl + \`** (Directory Hotlist) and select **`Cloud: Rclone (All Remotes)`**.
+   * Your active panel instantly displays all your configured cloud remotes:
+     - `dropbox-michele/`
+     - `googledrive-capimichi/`
+     - `home/`
+     - ...
+4. **On-Demand Deep Browsing:**
+   * Press **Enter** on any remote or subfolder to browse live on-demand.
+   * Full file management supported: **`F3`** (View), **`F5`** (Copy across panels or locally), **`F7`** (Mkdir), **`F8`** (Delete).
+5. **Clean Exit:**
+   * When you quit Midnight Commander (**`F10`**), the background server terminates automatically, leaving zero lingering processes or open ports.
+   * You can also stop it manually inside MC at any time with **`F2` -> `S`**.
 
 ---
 

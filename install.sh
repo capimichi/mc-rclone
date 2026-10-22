@@ -66,9 +66,15 @@ for line in lines:
 new_content = "".join(filtered).rstrip()
 block = """
 # START_MC_RCLONE
-R       Cloud Storage (Rclone All Remotes)
-	${HOME}/.local/share/mc/scripts/mc-rclone-bridge start \$PPID
-	%cd /#ftp:127.0.0.1:2123/
+R       Start Cloud Storage (Rclone Server)
+	${HOME}/.local/share/mc/scripts/mc-rclone-bridge start
+	echo "✓ Rclone Cloud Server started on 127.0.0.1:2123"
+	echo "Press Ctrl + \\\\ (Hotlist) -> 'Cloud: Rclone' to browse."
+	sleep 1
+
+S       Stop Cloud Storage (Rclone Server)
+	${HOME}/.local/share/mc/scripts/mc-rclone-bridge stop
+	sleep 1
 # END_MC_RCLONE
 """
 final_content = (new_content + "\n" + block.lstrip()).lstrip()
@@ -80,12 +86,20 @@ echo "✓ Configured User Menu entry in ${MENU_FILE} (F2 -> R)"
 # 5. Configure Directory Hotlist (~/.config/mc/hotlist)
 mkdir -p "$(dirname "${HOTLIST_FILE}")"
 touch "${HOTLIST_FILE}"
-if ! grep -q "127.0.0.1:2123" "${HOTLIST_FILE}" 2>/dev/null; then
-    cat >> "${HOTLIST_FILE}" << 'EOF'
-ENTRY "Cloud: Rclone (All Remotes)" URL "/#ftp:127.0.0.1:2123/"
+python3 - <<EOF
+import os
+hl_path = os.path.expanduser("${HOTLIST_FILE}")
+lines = []
+if os.path.isfile(hl_path):
+    with open(hl_path, "r") as f:
+        lines = f.readlines()
+# Remove old /#rclone+ or duplicate entries
+filtered = [l for l in lines if "/#rclone+" not in l and "127.0.0.1:2123" not in l]
+filtered.append('ENTRY "Cloud: Rclone (All Remotes)" URL "ftp://127.0.0.1:2123"\\n')
+with open(hl_path, "w") as f:
+    f.writelines(filtered)
 EOF
-    echo "✓ Added hotlist bookmark 'Cloud: Rclone (All Remotes)'"
-fi
+echo "✓ Configured Hotlist bookmark 'Cloud: Rclone (All Remotes)'"
 
 echo ""
 echo "==> Installation complete!"
