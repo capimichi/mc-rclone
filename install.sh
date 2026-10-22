@@ -68,7 +68,7 @@ block = """
 # START_MC_RCLONE
 R       Cloud Storage (Rclone All Remotes)
 	${HOME}/.local/share/mc/scripts/mc-rclone-bridge start \$PPID
-	%cd ftp://127.0.0.1:2123/
+	%cd /#ftp:127.0.0.1:2123/
 # END_MC_RCLONE
 """
 final_content = (new_content + "\n" + block.lstrip()).lstrip()
@@ -80,9 +80,9 @@ echo "✓ Configured User Menu entry in ${MENU_FILE} (F2 -> R)"
 # 5. Configure Directory Hotlist (~/.config/mc/hotlist)
 mkdir -p "$(dirname "${HOTLIST_FILE}")"
 touch "${HOTLIST_FILE}"
-if ! grep -q "ftp://127.0.0.1:2123/" "${HOTLIST_FILE}" 2>/dev/null; then
+if ! grep -q "127.0.0.1:2123" "${HOTLIST_FILE}" 2>/dev/null; then
     cat >> "${HOTLIST_FILE}" << 'EOF'
-ENTRY "Cloud: Rclone (All Remotes)" URL "ftp://127.0.0.1:2123/"
+ENTRY "Cloud: Rclone (All Remotes)" URL "/#ftp:127.0.0.1:2123/"
 EOF
     echo "✓ Added hotlist bookmark 'Cloud: Rclone (All Remotes)'"
 fi
