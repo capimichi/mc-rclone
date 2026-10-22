@@ -1,30 +1,75 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-# mc-rclone uninstaller
-
-TARGET_FILE="${HOME}/.local/share/mc/extfs.d/rclone+"
+TARGET_SCRIPTS_DIR="${HOME}/.local/share/mc/scripts"
+TARGET_EXTFS_DIR="${HOME}/.local/share/mc/extfs.d"
+BRIDGE_LINK="${TARGET_SCRIPTS_DIR}/mc-rclone-bridge"
+EXTFS_LINK="${TARGET_EXTFS_DIR}/rclone+"
 CACHE_DIR="${HOME}/.cache/mc/rclone"
+MENU_FILE="${HOME}/.config/mc/menu"
 HOTLIST_FILE="${HOME}/.config/mc/hotlist"
 
 echo "==> Uninstalling mc-rclone..."
 
-if [ -L "${TARGET_FILE}" ] || [ -f "${TARGET_FILE}" ]; then
-    rm -f "${TARGET_FILE}"
-    echo "Removed: ${TARGET_FILE}"
-else
-    echo "File not found: ${TARGET_FILE}"
+# 1. Stop bridge if running
+if [ -x "${BRIDGE_LINK}" ]; then
+    "${BRIDGE_LINK}" stop || true
 fi
 
+# 2. Remove script links
+if [ -L "${BRIDGE_LINK}" ] || [ -f "${BRIDGE_LINK}" ]; then
+    rm -f "${BRIDGE_LINK}"
+    echo "✓ Removed ${BRIDGE_LINK}"
+fi
+if [ -L "${EXTFS_LINK}" ] || [ -f "${EXTFS_LINK}" ]; then
+    rm -f "${EXTFS_LINK}"
+    echo "✓ Removed ${EXTFS_LINK}"
+fi
+
+# 3. Clean user menu
+if [ -f "${MENU_FILE}" ]; then
+    python3 - <<EOF
+import os
+menu_path = os.path.expanduser("${MENU_FILE}")
+if os.path.isfile(menu_path):
+    with open(menu_path, "r") as f:
+        lines = f.readlines()
+    filtered = []
+    skip = False
+    for line in lines:
+        if "# START_MC_RCLONE" in line or "mc-rclone-bridge" in line:
+            skip = True
+            continue
+        if "# END_MC_RCLONE" in line:
+            skip = False
+            continue
+        if not skip:
+            filtered.append(line)
+    with open(menu_path, "w") as f:
+        f.writelines(filtered)
+EOF
+    echo "✓ Cleaned user menu entries in ${MENU_FILE}"
+fi
+
+# 4. Clean hotlist
+if [ -f "${HOTLIST_FILE}" ]; then
+    python3 - <<EOF
+import os
+hl_path = os.path.expanduser("${HOTLIST_FILE}")
+if os.path.isfile(hl_path):
+    with open(hl_path, "r") as f:
+        lines = f.readlines()
+    filtered = [l for l in lines if "127.0.0.1:2123" not in l and "rclone+" not in l]
+    with open(hl_path, "w") as f:
+        f.writelines(filtered)
+EOF
+    echo "✓ Cleaned hotlist entries in ${HOTLIST_FILE}"
+fi
+
+# 5. Clean cache
 if [ -d "${CACHE_DIR}" ]; then
     rm -rf "${CACHE_DIR}"
-    echo "Removed cache: ${CACHE_DIR}"
+    echo "✓ Removed cache ${CACHE_DIR}"
 fi
 
-# Clean up hotlist entries
-if [ -f "${HOTLIST_FILE}" ]; then
-    sed -i.bak '/rclone+/d' "${HOTLIST_FILE}" 2>/dev/null || true
-    rm -f "${HOTLIST_FILE}.bak" 2>/dev/null || true
-fi
-
-echo "==> mc-rclone uninstalled."
+echo "==> mc-rclone uninstalled successfully."
