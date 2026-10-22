@@ -58,6 +58,8 @@ for line in lines:
     if "# END_MC_RCLONE" in line:
         skip = False
         continue
+    if "rclone://" in line or (line.strip().startswith("R") and "Connect to Rclone" in line):
+        continue
     if not skip:
         filtered.append(line)
 
