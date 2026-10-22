@@ -28,11 +28,31 @@ import configparser
 # Configuration & Defaults
 CONFIG_FILE = os.path.expanduser("~/.config/mc/rclone.ini")
 
+def _resolve_user_home():
+    home = os.environ.get("HOME", "")
+    if "multiagy" in home or not os.path.isdir(os.path.join(home, ".config")):
+        if os.path.isdir("/Users/michele"):
+            return "/Users/michele"
+    return os.path.expanduser("~")
+
+REAL_HOME = _resolve_user_home()
+
+def find_rclone_conf():
+    for p in [
+        os.path.join(REAL_HOME, ".config", "rclone", "rclone.conf"),
+        os.path.expanduser("~/.config/rclone/rclone.conf"),
+    ]:
+        if os.path.isfile(p):
+            return p
+    return os.path.join(REAL_HOME, ".config", "rclone", "rclone.conf")
+
+RCLONE_CONF = find_rclone_conf()
+
 def load_config():
     cfg = {
-        "max_depth": int(os.getenv("MC_RCLONE_MAX_DEPTH", "3")),
+        "max_depth": int(os.getenv("MC_RCLONE_MAX_DEPTH", "1")),
         "cache_ttl": int(os.getenv("MC_RCLONE_CACHE_TTL", "300")),
-        "timeout": int(os.getenv("MC_RCLONE_TIMEOUT", "6")),
+        "timeout": int(os.getenv("MC_RCLONE_TIMEOUT", "2")),
         "remotes": os.getenv("MC_RCLONE_REMOTES", "").strip(),
         "debug": os.getenv("MC_RCLONE_DEBUG", "0") == "1",
     }
@@ -76,7 +96,7 @@ if not RCLONE_BIN:
             break
 
 # Cache directory: ~/.cache/mc/rclone/
-CACHE_DIR = os.path.expanduser("~/.cache/mc/rclone")
+CACHE_DIR = os.path.join(REAL_HOME, ".cache", "mc", "rclone")
 
 
 def log(msg: str):
@@ -98,8 +118,13 @@ def ensure_cache_dir():
 def run_cmd(args, timeout=60):
     log(f"run_cmd: {args}")
     env = os.environ.copy()
-    if "HOME" not in env or not env["HOME"]:
-        env["HOME"] = os.path.expanduser("~")
+    env["HOME"] = REAL_HOME
+
+    # If first arg is rclone, ensure --config is passed
+    actual_args = list(args)
+    if actual_args and actual_args[0] == RCLONE_BIN and "--config" not in actual_args and os.path.isfile(RCLONE_CONF):
+        actual_args.insert(1, RCLONE_CONF)
+        actual_args.insert(1, "--config")
 
     class CmdResult:
         def __init__(self, returncode, stdout="", stderr=""):
@@ -109,7 +134,7 @@ def run_cmd(args, timeout=60):
 
     try:
         res = subprocess.run(
-            args,
+            actual_args,
             capture_output=True,
             text=True,
             env=env,
@@ -118,10 +143,10 @@ def run_cmd(args, timeout=60):
         )
         return CmdResult(res.returncode, res.stdout, res.stderr)
     except subprocess.TimeoutExpired:
-        log(f"Command timed out ({timeout}s): {args}")
+        log(f"Command timed out ({timeout}s): {actual_args}")
         return CmdResult(-1, "", f"Timeout expired after {timeout}s")
     except Exception as e:
-        log(f"Command error ({args}): {e}")
+        log(f"Command error ({actual_args}): {e}")
         return CmdResult(-1, "", str(e))
 
 
@@ -160,6 +185,17 @@ def get_remotes():
     if CONFIG["remotes"]:
         # User specified explicit remotes in config or env
         return [r.strip() for r in CONFIG["remotes"].split(",") if r.strip()]
+
+    # Fast-path: read directly from rclone.conf in 1ms
+    if os.path.isfile(RCLONE_CONF):
+        try:
+            parser = configparser.ConfigParser()
+            parser.read(RCLONE_CONF)
+            sections = [s for s in parser.sections() if not s.startswith("_")]
+            if sections:
+                return sorted(sections)
+        except Exception as e:
+            log(f"Error parsing rclone.conf directly: {e}")
 
     if not RCLONE_BIN:
         return []

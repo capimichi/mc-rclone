@@ -7,8 +7,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="${HOME}/.local/share/mc/extfs.d"
 TARGET_FILE="${TARGET_DIR}/rclone+"
+HOTLIST_FILE="${HOME}/.config/mc/hotlist"
 
-echo "==> Installing mc-rclone..."
+echo "==> Installing mc-rclone plugin for Midnight Commander..."
 
 # Ensure target directory exists
 mkdir -p "${TARGET_DIR}"
@@ -28,29 +29,24 @@ fi
 chmod +x "${SCRIPT_DIR}/rclone+"
 ln -sf "${SCRIPT_DIR}/rclone+" "${TARGET_FILE}"
 
-# Install mc-rclone utility to ~/.local/bin/mc-rclone (does not touch system mc)
-mkdir -p "${HOME}/.local/bin"
-chmod +x "${SCRIPT_DIR}/mc-rclone"
-ln -sf "${SCRIPT_DIR}/mc-rclone" "${HOME}/.local/bin/mc-rclone"
-
-# Sync hotlist bookmarks
-"${SCRIPT_DIR}/mc-rclone" sync
-
-# Enable macOS background service so it is always ready on-demand
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    "${SCRIPT_DIR}/mc-rclone" service-install
+# Add Hotlist entry if not already present
+if [ -f "${HOTLIST_FILE}" ]; then
+    if ! grep -q "/#rclone+" "${HOTLIST_FILE}"; then
+        echo 'ENTRY "Cloud: Rclone (All Remotes)" URL "/#rclone+"' >> "${HOTLIST_FILE}"
+        echo "==> Added Rclone bookmark to Midnight Commander Hotlist."
+    fi
+else
+    mkdir -p "$(dirname "${HOTLIST_FILE}")"
+    echo 'ENTRY "Cloud: Rclone (All Remotes)" URL "/#rclone+"' > "${HOTLIST_FILE}"
+    echo "==> Created Midnight Commander Hotlist with Rclone bookmark."
 fi
 
-echo "==> Successfully installed:"
-echo "    - Rclone manager: ${HOME}/.local/bin/mc-rclone"
-echo "    - ExtFS helper:   ${TARGET_FILE}"
+echo "==> Successfully installed mc-rclone plugin:"
+echo "    ${TARGET_FILE}"
 echo ""
 echo "How to use:"
-echo "  - In Midnight Commander (mc):"
-echo "    Press Ctrl+\\ (Directory Hotlist) to connect to any cloud remote on-demand."
-echo "  - Daemon / Service management:"
-echo "    mc-rclone status              # shows service & remote status"
-echo "    mc-rclone service-install     # enable auto-start on macOS login"
-echo "    mc-rclone service-uninstall   # disable auto-start on macOS login"
-
-
+echo "  1. Open Midnight Commander: mc"
+echo "  2. Press Ctrl+\\ (Directory Hotlist) and select 'Cloud: Rclone'"
+echo "     or simply navigate to: cd /#rclone+"
+echo ""
+echo "100% portable: No background daemons, no services, no open ports."
