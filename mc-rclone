@@ -1,477 +1,370 @@
 #!/usr/bin/env python3
 """
-mc-rclone - High-performance on-demand Rclone activator for GNU Midnight Commander.
-
-Features:
-- Socket Activation: Listens on localhost ports (2121..2199).
-- Zero Idle Resources: Rclone is NOT running until you click a remote in MC.
-- Pure On-Demand: Clicking a remote in MC (Ctrl+\\) wakes up rclone serve ftp in 50ms.
-- Auto-Idle Shutdown: Shuts down rclone instances after 15 minutes of inactivity.
-- Dynamic Hotlist: Keeps ~/.config/mc/hotlist in sync with rclone.conf automatically.
-
-Part of mc-rclone: https://github.com/capimichi/mc-rclone
-License: GNU General Public License v3.0 (GPL-3.0)
+mc-rclone - On-demand Rclone FTP bridge for GNU Midnight Commander.
+Supports XDG configuration, configurable VFS cache, and multi-instance MC watchdog.
 """
 
 import sys
 import os
-import json
-import shutil
-import socket
-import select
-import subprocess
 import time
-import signal
-import threading
+import socket
+import subprocess
 import configparser
+import shutil
+import signal
+from pathlib import Path
 
-BASE_PORT = 2121
-BACKEND_BASE_PORT = 12121
-IDLE_TIMEOUT = 900  # 15 minutes of inactivity before stopping an rclone instance
 
-def _resolve_user_home():
-    # If launched under sandbox/virtualized HOME, detect real user home
+def get_real_home():
+    if os.environ.get("MC_RCLONE_HOME"):
+        return os.environ["MC_RCLONE_HOME"]
     home = os.environ.get("HOME", "")
     if "multiagy" in home or not os.path.isdir(os.path.join(home, ".config")):
         if os.path.isdir("/Users/michele"):
             return "/Users/michele"
     return os.path.expanduser("~")
 
-REAL_HOME = _resolve_user_home()
-CACHE_DIR = os.path.join(REAL_HOME, ".cache", "mc", "rclone")
-PID_FILE = os.path.join(CACHE_DIR, "daemon.pid")
-LOG_DIR = os.path.join(CACHE_DIR, "logs")
-RCLONE_CONF = os.path.join(REAL_HOME, ".config", "rclone", "rclone.conf")
-HOTLIST_FILE = os.path.join(REAL_HOME, ".config", "mc", "hotlist")
-LAST_SYNC_FILE = os.path.join(CACHE_DIR, "last_sync_time")
 
-RCLONE_BIN = shutil.which("rclone")
-if not RCLONE_BIN:
-    for fallback in ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]:
-        if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
-            RCLONE_BIN = fallback
-            break
+REAL_HOME = get_real_home()
+CACHE_DIR = Path(REAL_HOME) / ".cache" / "mc" / "rclone"
+PID_FILE = CACHE_DIR / "bridge.pid"
+LOG_FILE = CACHE_DIR / "bridge.log"
+
+CONFIG_DIR = Path(REAL_HOME) / ".config" / "mc-rclone"
+CONFIG_FILE = CONFIG_DIR / "config.ini"
+
+DEFAULT_CONFIG_CONTENT = """# mc-rclone configuration file
+
+[server]
+# Local IP address to bind the FTP server (loopback for security)
+bind_address = 127.0.0.1
+
+# Local FTP port used by rclone and configured in Midnight Commander hotlist
+port = 2123
+
+[vfs]
+# VFS cache mode: off | minimal | writes | full
+# - writes: Modified or copied files are buffered locally and uploaded in background (recommended)
+# - full: Caches both reads and writes; enables random seeking for large media/archive files
+cache_mode = writes
+
+# Maximum size of local VFS disk cache (e.g. 5G, 10G, 50G, off)
+cache_max_size = 10G
+
+# Maximum age of cached files before automatic eviction (e.g. 24h, 7d)
+cache_max_age = 24h
+
+# Directory listing cache duration (instant directory navigation without repeated API calls)
+dir_cache_time = 5m
+
+[network]
+# Socket connection timeout in seconds for probing SFTP/SSH remotes
+# Unreachable or offline remotes are automatically skipped to prevent rclone hangs
+sftp_probe_timeout = 0.2
+"""
+
+DEFAULTS = {
+    "bind_address": "127.0.0.1",
+    "port": 2123,
+    "cache_mode": "writes",
+    "cache_max_size": "10G",
+    "cache_max_age": "24h",
+    "dir_cache_time": "5m",
+    "sftp_probe_timeout": 0.2,
+}
 
 
-def get_remotes():
-    """Read remotes directly from rclone.conf."""
-    if not os.path.isfile(RCLONE_CONF):
-        return []
-    try:
-        parser = configparser.ConfigParser()
-        parser.read(RCLONE_CONF)
-        return sorted(parser.sections())
-    except Exception:
-        env = os.environ.copy()
-        env["HOME"] = REAL_HOME
-        res = subprocess.run([RCLONE_BIN, "--config", RCLONE_CONF, "listremotes"], capture_output=True, text=True, env=env)
-        if res.returncode == 0:
-            return sorted([l.strip().rstrip(":") for l in res.stdout.splitlines() if l.strip()])
-    return []
-
-
-def get_port_for_remote(remote: str, remotes_list=None) -> int:
-    remotes = remotes_list if remotes_list is not None else get_remotes()
-    if remote in remotes:
-        return BASE_PORT + remotes.index(remote)
-    return BASE_PORT + (abs(hash(remote)) % 100)
-
-
-def sync_hotlist(silent=False):
-    """Sync MC hotlist if rclone.conf was modified."""
-    if not os.path.isfile(RCLONE_CONF):
-        return
-
-    conf_mtime = os.path.getmtime(RCLONE_CONF)
-    last_sync = 0
-    if os.path.isfile(LAST_SYNC_FILE):
+def load_or_create_config(config_path: Path = CONFIG_FILE) -> dict:
+    """Load config from path or generate default file if missing."""
+    if not config_path.exists():
         try:
-            with open(LAST_SYNC_FILE, "r") as f:
-                last_sync = float(f.read().strip())
-        except Exception:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(DEFAULT_CONFIG_CONTENT)
+        except OSError:
             pass
+        return DEFAULTS.copy()
 
-    if os.path.isfile(HOTLIST_FILE) and conf_mtime <= last_sync:
-        return
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(config_path)
+    except Exception:
+        return DEFAULTS.copy()
 
-    remotes = get_remotes()
-    if not remotes:
-        return
-
-    os.makedirs(os.path.dirname(HOTLIST_FILE), exist_ok=True)
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-    existing_entries = []
-    if os.path.isfile(HOTLIST_FILE):
-        with open(HOTLIST_FILE, "r") as f:
-            for line in f:
-                if 'URL "/ftp://127.0.0.1:' not in line and 'ENTRY "Cloud:' not in line:
-                    existing_entries.append(line.rstrip("\n"))
-
-    rclone_entries = []
-    for r in remotes:
-        port = get_port_for_remote(r, remotes)
-        rclone_entries.append(f'ENTRY "Cloud: {r}" URL "/ftp://127.0.0.1:{port}/"')
-
-    with open(HOTLIST_FILE, "w") as f:
-        for entry in rclone_entries:
-            f.write(entry + "\n")
-        for entry in existing_entries:
-            if entry.strip():
-                f.write(entry + "\n")
-
-    with open(LAST_SYNC_FILE, "w") as f:
-        f.write(str(conf_mtime))
-
-    if not silent:
-        print(f"Synced {len(remotes)} cloud remotes to Midnight Commander Hotlist.")
+    return {
+        "bind_address": parser.get("server", "bind_address", fallback=DEFAULTS["bind_address"]),
+        "port": parser.getint("server", "port", fallback=DEFAULTS["port"]),
+        "cache_mode": parser.get("vfs", "cache_mode", fallback=DEFAULTS["cache_mode"]),
+        "cache_max_size": parser.get("vfs", "cache_max_size", fallback=DEFAULTS["cache_max_size"]),
+        "cache_max_age": parser.get("vfs", "cache_max_age", fallback=DEFAULTS["cache_max_age"]),
+        "dir_cache_time": parser.get("vfs", "dir_cache_time", fallback=DEFAULTS["dir_cache_time"]),
+        "sftp_probe_timeout": parser.getfloat("network", "sftp_probe_timeout", fallback=DEFAULTS["sftp_probe_timeout"]),
+    }
 
 
-class OnDemandDaemon:
-    def __init__(self):
-        self.remotes = get_remotes()
-        self.active_backends = {}  # remote -> {"proc": Popen, "backend_port": int, "last_active": float}
-        self.listeners = {}        # public_port -> (server_sock, remote, backend_port)
-        self.lock = threading.Lock()
-        self.running = True
+def find_rclone_conf() -> str:
+    candidates = [
+        os.path.join(REAL_HOME, ".config", "rclone", "rclone.conf"),
+        os.path.expanduser("~/.config/rclone/rclone.conf"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return candidates[0]
 
-    def ensure_backend(self, remote: str, backend_port: int):
-        with self.lock:
-            info = self.active_backends.get(remote)
-            if info and info["proc"].poll() is None:
-                info["last_active"] = time.time()
-                return
 
-            # Start rclone serve ftp on the backend port
-            env = os.environ.copy()
-            env["HOME"] = REAL_HOME
-
-            os.makedirs(LOG_DIR, exist_ok=True)
-            log_path = os.path.join(LOG_DIR, f"{remote}.log")
-            log_file = open(log_path, "a")
-
-            cmd = [
-                RCLONE_BIN,
-                "--config",
-                RCLONE_CONF,
-                "serve",
-                "ftp",
-                f"{remote}:",
-                "--addr",
-                f"127.0.0.1:{backend_port}",
-                "--vfs-cache-mode",
-                "writes",
-            ]
-
-            proc = subprocess.Popen(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env=env,
-                start_new_session=True,
-            )
-
-            # Wait for backend port to be open
-            for _ in range(50):
-                try:
-                    s = socket.socket()
-                    s.settimeout(0.1)
-                    s.connect(("127.0.0.1", backend_port))
-                    s.close()
-                    break
-                except Exception:
-                    time.sleep(0.05)
-
-            self.active_backends[remote] = {
-                "proc": proc,
-                "backend_port": backend_port,
-                "last_active": time.time(),
-            }
-
-    def proxy_connection(self, client_sock, remote: str, backend_port: int):
-        self.ensure_backend(remote, backend_port)
-
-        backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        backend_sock.connect(("127.0.0.1", backend_port))
-
-        def pipe(src, dst):
-            try:
-                while self.running:
-                    data = src.recv(8192)
-                    if not data:
-                        break
-                    dst.sendall(data)
-                    with self.lock:
-                        if remote in self.active_backends:
-                            self.active_backends[remote]["last_active"] = time.time()
-            except Exception:
-                pass
-            finally:
-                try: src.close()
-                except: pass
-                try: dst.close()
-                except: pass
-
-        t1 = threading.Thread(target=pipe, args=(client_sock, backend_sock), daemon=True)
-        t2 = threading.Thread(target=pipe, args=(backend_sock, client_sock), daemon=True)
-        t1.start()
-        t2.start()
-
-    def idle_reaper(self):
-        while self.running:
-            time.sleep(30)
-            now = time.time()
-            with self.lock:
-                for remote in list(self.active_backends.keys()):
-                    info = self.active_backends[remote]
-                    if now - info["last_active"] > IDLE_TIMEOUT:
-                        try:
-                            info["proc"].terminate()
-                        except Exception:
-                            pass
-                        del self.active_backends[remote]
-
-    def run(self):
-        sync_hotlist(silent=True)
-        self.remotes = get_remotes()
-
-        for idx, r in enumerate(self.remotes):
-            pub_port = BASE_PORT + idx
-            back_port = BACKEND_BASE_PORT + idx
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind(("127.0.0.1", pub_port))
-                sock.listen(15)
-                self.listeners[pub_port] = (sock, r, back_port)
-            except Exception as e:
-                pass
-
-        reaper_thread = threading.Thread(target=self.idle_reaper, daemon=True)
-        reaper_thread.start()
-
-        poll_list = [sock for sock, _, _ in self.listeners.values()]
-
-        while self.running:
-            readable, _, _ = select.select(poll_list, [], [], 1.0)
-            for sock in readable:
-                try:
-                    client_sock, _ = sock.accept()
-                    # Find which remote this socket belongs to
-                    for pub_port, (s, remote, back_port) in self.listeners.items():
-                        if s == sock:
-                            threading.Thread(
-                                target=self.proxy_connection,
-                                args=(client_sock, remote, back_port),
-                                daemon=True,
-                            ).start()
-                            break
-                except Exception:
-                    pass
-
-    def stop(self):
-        self.running = False
-        with self.lock:
-            for info in self.active_backends.values():
-                try:
-                    info["proc"].terminate()
-                except Exception:
-                    pass
-            self.active_backends.clear()
-        for sock, _, _ in self.listeners.values():
-            try:
-                sock.close()
-            except Exception:
-                pass
+def is_port_open(host: str, port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.3)
+    try:
+        res = sock.connect_ex((host, port))
+        return res == 0
+    finally:
+        sock.close()
 
 
 def is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except (OSError, ProcessLookupError):
         return False
 
 
-def start_daemon_background():
-    """Start daemon in background detached."""
-    if os.path.isfile(PID_FILE):
+def count_user_mc_instances() -> int:
+    """Count active Midnight Commander instances belonging to current user."""
+    try:
+        output = subprocess.check_output(
+            ["ps", "-u", str(os.getuid()), "-o", "comm="],
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+        count = 0
+        for line in output.splitlines():
+            base = os.path.basename(line.strip()).lower()
+            if base in ("mc", "midnight-commander", "mc.real"):
+                count += 1
+        return count
+    except Exception:
+        return 1
+
+
+def find_mc_pid() -> int | None:
+    curr = os.getpid()
+    while curr > 1:
         try:
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
+            out = subprocess.check_output(
+                ["ps", "-o", "ppid=", "-o", "comm=", "-p", str(curr)],
+                text=True
+            ).strip()
+            parts = out.split(None, 1)
+            if not parts:
+                break
+            ppid = int(parts[0])
+            comm = parts[1] if len(parts) > 1 else ""
+            base = os.path.basename(comm).lower()
+            if base in ("mc", "midnight-commander", "mc.real"):
+                return curr
+            curr = ppid
+        except Exception:
+            break
+    return None
+
+
+def get_remotes(sftp_timeout: float = 0.2) -> list[str]:
+    """Extract configured remotes. For SFTP remotes, probes port to avoid combine startup crashes."""
+    conf_path = find_rclone_conf()
+    if not os.path.isfile(conf_path):
+        return []
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(conf_path)
+    except Exception:
+        return []
+
+    active_remotes = []
+    for sec in parser.sections():
+        if sec.startswith("_"):
+            continue
+        rtype = parser[sec].get("type", "")
+        if rtype == "sftp":
+            host = parser[sec].get("host", "")
+            port = int(parser[sec].get("port", 22))
+            try:
+                s = socket.socket()
+                s.settimeout(sftp_timeout)
+                if s.connect_ex((host, port)) == 0:
+                    active_remotes.append(sec)
+                s.close()
+            except Exception:
+                pass
+        else:
+            active_remotes.append(sec)
+
+    return active_remotes
+
+
+def build_rclone_cmd(cfg: dict, upstreams: str, rclone_bin: str = "rclone", conf_path: str = None) -> list[str]:
+    cmd = [rclone_bin]
+    if conf_path:
+        cmd.extend(["--config", conf_path])
+    cmd.extend([
+        "serve", "ftp",
+        "--addr", f"{cfg['bind_address']}:{cfg['port']}",
+        "--vfs-cache-mode", cfg["cache_mode"],
+        "--vfs-cache-max-size", cfg["cache_max_size"],
+        "--vfs-cache-max-age", cfg["cache_max_age"],
+        "--dir-cache-time", cfg["dir_cache_time"],
+        "--combine-upstreams", upstreams,
+        ":combine:",
+    ])
+    return cmd
+
+
+def stop() -> int:
+    if PID_FILE.is_file():
+        try:
+            pid = int(PID_FILE.read_text().strip())
             if is_pid_alive(pid):
-                print(f"mc-rclone on-demand daemon is already running (PID {pid}).")
-                return
+                os.kill(pid, signal.SIGTERM)
+                for _ in range(25):
+                    time.sleep(0.1)
+                    if not is_pid_alive(pid):
+                        break
+                if is_pid_alive(pid):
+                    os.kill(pid, signal.SIGKILL)
         except Exception:
             pass
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+    print("mc-rclone stopped.")
+    return 0
 
-    sync_hotlist(silent=True)
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    proc = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "daemon-foreground"],
+
+def status() -> int:
+    cfg = load_or_create_config()
+    addr = cfg["bind_address"]
+    port = cfg["port"]
+    if PID_FILE.is_file():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            if is_pid_alive(pid) and is_port_open(addr, port):
+                print(f"mc-rclone is running (PID {pid}, listening on {addr}:{port}).")
+                return 0
+        except Exception:
+            pass
+    print("mc-rclone is stopped.")
+    return 1
+
+
+def start(parent_pid: int | None = None) -> int:
+    cfg = load_or_create_config()
+    addr = cfg["bind_address"]
+    port = cfg["port"]
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if is_port_open(addr, port):
+        print(f"mc-rclone is already running on {addr}:{port}.")
+        return 0
+
+    if parent_pid is None or parent_pid <= 1:
+        parent_pid = find_mc_pid() or os.getppid()
+
+    remotes = get_remotes(sftp_timeout=cfg["sftp_probe_timeout"])
+    if not remotes:
+        sys.stderr.write("Error: No active remotes found in rclone.conf\n")
+        return 1
+
+    upstreams = " ".join([f"{r}={r}:" for r in remotes])
+    rclone_bin = shutil.which("rclone") or "/opt/homebrew/bin/rclone"
+    conf_path = find_rclone_conf()
+
+    cmd = build_rclone_cmd(cfg, upstreams, rclone_bin=rclone_bin, conf_path=conf_path)
+
+    daemon_code = f"""
+import subprocess, time, os, sys, signal
+
+parent_pid = {parent_pid}
+cmd = {cmd!r}
+pid_file = {str(PID_FILE)!r}
+log_file = {str(LOG_FILE)!r}
+
+def count_mc():
+    try:
+        output = subprocess.check_output(
+            ["ps", "-u", str(os.getuid()), "-o", "comm="],
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+        count = 0
+        for line in output.splitlines():
+            base = os.path.basename(line.strip()).lower()
+            if base in ("mc", "midnight-commander", "mc.real"):
+                count += 1
+        return count
+    except Exception:
+        return 1
+
+with open(log_file, "a") as log:
+    proc = subprocess.Popen(cmd, stdout=log, stderr=log)
+    with open(pid_file, "w") as f:
+        f.write(str(proc.pid))
+
+    try:
+        while True:
+            time.sleep(1.5)
+            if proc.poll() is not None:
+                break
+            # Multi-instance check: terminate if no user MC instances remain
+            if count_mc() == 0:
+                break
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if os.path.isfile(pid_file):
+            try:
+                os.remove(pid_file)
+            except Exception:
+                pass
+"""
+    subprocess.Popen(
+        [sys.executable, "-c", daemon_code],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
-    with open(PID_FILE, "w") as f:
-        f.write(str(proc.pid))
+    for _ in range(40):
+        time.sleep(0.1)
+        if is_port_open(addr, port):
+            print(f"mc-rclone started successfully on {addr}:{port}.")
+            return 0
 
-    print(f"mc-rclone on-demand daemon started in background (PID {proc.pid}).")
-    print("All cloud remotes are now listening on localhost and ready in MC (Ctrl+\\).")
-
-
-def stop_daemon():
-    """Stop the running background daemon and any active rclone instances."""
-    if os.path.isfile(PID_FILE):
-        try:
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
-            if is_pid_alive(pid):
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(0.3)
-                if is_pid_alive(pid):
-                    os.kill(pid, signal.SIGKILL)
-            os.remove(PID_FILE)
-            print(f"Stopped mc-rclone daemon (PID {pid}).")
-        except Exception:
-            pass
-    else:
-        print("mc-rclone daemon is not running.")
-
-    # Also cleanup any orphaned rclone serve ftp
-    try:
-        subprocess.run(["pkill", "-f", "rclone serve ftp"], check=False)
-    except Exception:
-        pass
-
-
-PLIST_LABEL = "com.capimichi.mc-rclone"
-PLIST_PATH = os.path.join(REAL_HOME, "Library", "LaunchAgents", f"{PLIST_LABEL}.plist")
-
-
-def install_launchd_service():
-    """Install and enable macOS LaunchAgent so mc-rclone is always available."""
-    os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-    script_path = os.path.abspath(__file__)
-    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{PLIST_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{sys.executable}</string>
-        <string>{script_path}</string>
-        <string>daemon-foreground</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{os.path.join(CACHE_DIR, "launchd.log")}</string>
-    <key>StandardErrorPath</key>
-    <string>{os.path.join(CACHE_DIR, "launchd_err.log")}</string>
-</dict>
-</plist>
-"""
-    with open(PLIST_PATH, "w") as f:
-        f.write(plist_content)
-
-    subprocess.run(["launchctl", "unload", PLIST_PATH], capture_output=True)
-    res = subprocess.run(["launchctl", "load", PLIST_PATH], capture_output=True, text=True)
-    if res.returncode == 0:
-        print(f"mc-rclone service installed and active via macOS LaunchAgent.")
-        print("Cloud remotes will now be permanently available on-demand in Midnight Commander.")
-    else:
-        print(f"Notice during service load: {res.stderr.strip()}")
-
-
-def uninstall_launchd_service():
-    """Unload and remove macOS LaunchAgent."""
-    if os.path.isfile(PLIST_PATH):
-        subprocess.run(["launchctl", "unload", PLIST_PATH], capture_output=True)
-        try:
-            os.remove(PLIST_PATH)
-        except Exception:
-            pass
-        print(f"mc-rclone service uninstalled ({PLIST_PATH} removed).")
-    else:
-        print("mc-rclone service is not installed.")
-
-
-def cmd_status():
-    running = False
-    pid = None
-    if os.path.isfile(PID_FILE):
-        try:
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
-            running = is_pid_alive(pid)
-        except Exception:
-            pass
-
-    if not running:
-        # Check if listening on BASE_PORT
-        try:
-            s = socket.socket()
-            s.settimeout(0.2)
-            s.connect(("127.0.0.1", BASE_PORT))
-            s.close()
-            running = True
-        except Exception:
-            pass
-
-    service_installed = os.path.isfile(PLIST_PATH)
-    status_str = f"\033[92mRUNNING\033[0m" if running else "\033[90mSTOPPED\033[0m"
-    service_str = "\033[92mENABLED (auto-start at login)\033[0m" if service_installed else "\033[90mNOT INSTALLED\033[0m"
-    print(f"\nmc-rclone On-Demand Daemon: {status_str}")
-    print(f"macOS Background Service:  {service_str}\n")
-
-    remotes = get_remotes()
-    print(f"{'REMOTE':<30} {'PORT':<8} {'VFS URL'}")
-    print("-" * 65)
-    for idx, r in enumerate(remotes):
-        port = BASE_PORT + idx
-        print(f"{r:<30} {port:<8} /ftp://127.0.0.1:{port}/")
-    print()
+    sys.stderr.write("Error: Timed out waiting for FTP server to listen.\n")
+    return 1
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] == "status":
-        cmd_status()
-        return
+    if len(sys.argv) < 2:
+        print("Usage: mc-rclone {start [mc_pid]|stop|status}")
+        sys.exit(1)
 
     cmd = sys.argv[1].lower()
-
-    if cmd == "daemon-foreground":
-        daemon = OnDemandDaemon()
-        def sig_handler(signum, frame):
-            daemon.stop()
-            sys.exit(0)
-        signal.signal(signal.SIGTERM, sig_handler)
-        signal.signal(signal.SIGINT, sig_handler)
-        daemon.run()
-    elif cmd in ["start", "daemon-start"]:
-        start_daemon_background()
-    elif cmd in ["stop", "daemon-stop"]:
-        stop_daemon()
-    elif cmd in ["restart"]:
-        stop_daemon()
-        time.sleep(0.5)
-        start_daemon_background()
-    elif cmd in ["sync", "sync-hotlist"]:
-        sync_hotlist(silent=False)
-    elif cmd in ["service-install", "enable"]:
-        install_launchd_service()
-    elif cmd in ["service-uninstall", "disable"]:
-        uninstall_launchd_service()
+    if cmd == "start":
+        parent_pid = int(sys.argv[2]) if len(sys.argv) > 2 else None
+        sys.exit(start(parent_pid))
+    elif cmd == "stop":
+        sys.exit(stop())
+    elif cmd == "status":
+        sys.exit(status())
     else:
-        print("Usage: mc-rclone [start|stop|restart|status|sync|service-install|service-uninstall]")
+        print(f"Unknown command: {cmd}")
         sys.exit(1)
 
 
