@@ -154,11 +154,14 @@ def is_pid_alive(pid: int) -> bool:
         return False
 
 
+LAST_REMOTES_FILE = CONFIG_DIR / "last_remotes.json"
+
+
 def count_user_mc_instances() -> int:
     """Count active Midnight Commander instances belonging to current user."""
     try:
         output = subprocess.check_output(
-            ["ps", "-u", str(os.getuid()), "-o", "comm="],
+            ["/bin/ps", "-u", str(os.getuid()), "-o", "comm="],
             stderr=subprocess.DEVNULL,
             text=True
         )
@@ -169,14 +172,44 @@ def count_user_mc_instances() -> int:
                 count += 1
         return count
     except Exception:
-        return 1
+        return 0
+
+
+def find_mc_pid() -> int | None:
+    curr = os.getpid()
+    while curr > 1:
+        try:
+            out = subprocess.check_output(
+                ["/bin/ps", "-o", "ppid=", "-o", "comm=", "-p", str(curr)],
+                stderr=subprocess.DEVNULL,
+                text=True
+            ).strip()
+            parts = out.split(None, 1)
+            if not parts:
+                break
+            ppid = int(parts[0])
+            comm = parts[1] if len(parts) > 1 else ""
+            base = os.path.basename(comm).lower()
+            if base in ("mc", "midnight-commander", "mc.real"):
+                return curr
+            curr = ppid
+        except Exception:
+            break
+    return None
 
 
 def get_active_remotes() -> list[str]:
-    """Read list of currently active remotes from state file."""
+    """Read list of currently active remotes from state file or last saved selection."""
     if ACTIVE_REMOTES_FILE.is_file():
         try:
             data = json.loads(ACTIVE_REMOTES_FILE.read_text())
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            pass
+    if LAST_REMOTES_FILE.is_file():
+        try:
+            data = json.loads(LAST_REMOTES_FILE.read_text())
             if isinstance(data, list):
                 return data
         except Exception:
@@ -185,10 +218,14 @@ def get_active_remotes() -> list[str]:
 
 
 def save_active_remotes(remotes: list[str]):
-    """Persist active remotes list to state file."""
+    """Persist active remotes list to state file and remember as default selection."""
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        ACTIVE_REMOTES_FILE.write_text(json.dumps(sorted(list(set(remotes))), indent=2))
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(sorted(list(set(remotes))), indent=2)
+        ACTIVE_REMOTES_FILE.write_text(content)
+        if remotes:
+            LAST_REMOTES_FILE.write_text(content)
     except Exception:
         pass
 
@@ -359,6 +396,9 @@ def start_with_remotes(selected_remotes: list[str], parent_pid: int | None = Non
         stop()
         return 0
 
+    if parent_pid is None or parent_pid <= 1:
+        parent_pid = find_mc_pid()
+
     # Probe each selected remote
     valid_remotes = []
     for r in selected_remotes:
@@ -371,18 +411,17 @@ def start_with_remotes(selected_remotes: list[str], parent_pid: int | None = Non
         sys.stderr.write("Error: None of the selected remotes are currently reachable.\n")
         return 1
 
-    save_active_remotes(valid_remotes)
-    upstreams = " ".join([f"{r}={r}:" for r in valid_remotes])
-    rclone_bin = shutil.which("rclone") or "/opt/homebrew/bin/rclone"
-    conf_path = find_rclone_conf()
-    cmd = build_rclone_cmd(cfg, upstreams, rclone_bin=rclone_bin, conf_path=conf_path)
-
-    # Check if server already running
+    # Check if server is already running with the exact same remotes
+    active_now = get_active_remotes()
     if PID_FILE.is_file():
         try:
             old_pid = int(PID_FILE.read_text().strip())
-            if is_pid_alive(old_pid):
-                # Hot-reload: stop old process and spawn updated one
+            if is_pid_alive(old_pid) and is_port_open(addr, port):
+                if set(valid_remotes) == set(active_now):
+                    print(f"✓ mc-rclone is already running on {addr}:{port} with: {', '.join(valid_remotes)}")
+                    return 0
+                # Remotes changed: notify user about hot-reload
+                print("ℹ Remotes changed: reloading Rclone server...")
                 os.kill(old_pid, signal.SIGTERM)
                 for _ in range(20):
                     time.sleep(0.05)
@@ -391,10 +430,16 @@ def start_with_remotes(selected_remotes: list[str], parent_pid: int | None = Non
         except Exception:
             pass
 
+    save_active_remotes(valid_remotes)
+    upstreams = " ".join([f"{r}={r}:" for r in valid_remotes])
+    rclone_bin = shutil.which("rclone") or "/opt/homebrew/bin/rclone"
+    conf_path = find_rclone_conf()
+    cmd = build_rclone_cmd(cfg, upstreams, rclone_bin=rclone_bin, conf_path=conf_path)
+
     daemon_code = f"""
 import subprocess, time, os, sys, signal
 
-parent_pid = {parent_pid}
+parent_mc_pid = {parent_pid}
 cmd = {cmd!r}
 pid_file = {str(PID_FILE)!r}
 log_file = {str(LOG_FILE)!r}
@@ -403,7 +448,7 @@ active_file = {str(ACTIVE_REMOTES_FILE)!r}
 def count_mc():
     try:
         output = subprocess.check_output(
-            ["ps", "-u", str(os.getuid()), "-o", "comm="],
+            ["/bin/ps", "-u", str(os.getuid()), "-o", "comm="],
             stderr=subprocess.DEVNULL,
             text=True
         )
@@ -414,33 +459,32 @@ def count_mc():
                 count += 1
         return count
     except Exception:
-        return 1
+        return 0
 
 with open(log_file, "a") as log:
     proc = subprocess.Popen(cmd, stdout=log, stderr=log)
     with open(pid_file, "w") as f:
         f.write(str(proc.pid))
 
-    consecutive_zero = 0
     try:
         while True:
-            time.sleep(1.5)
+            time.sleep(0.5)
             if proc.poll() is not None:
                 break
 
-            mc_count = count_mc()
-            if mc_count == 0:
-                consecutive_zero += 1
-                # Shut down if no MC process detected for 15 seconds (10 * 1.5s)
-                if consecutive_zero >= 10:
-                    if os.path.isfile(active_file):
-                        try:
-                            os.remove(active_file)
-                        except Exception:
-                            pass
-                    break
-            else:
-                consecutive_zero = 0
+            # If launched from within Midnight Commander, track its lifetime
+            if parent_mc_pid and parent_mc_pid > 1:
+                try:
+                    os.kill(parent_mc_pid, 0)
+                except (OSError, ProcessLookupError):
+                    # Parent MC died: verify if any other MC instance is running
+                    if count_mc() == 0:
+                        if os.path.isfile(active_file):
+                            try:
+                                os.remove(active_file)
+                            except Exception:
+                                pass
+                        break
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -565,6 +609,7 @@ def curses_checklist_ui(stdscr, remotes_info: list[tuple[str, str]], active_set:
 
 def select_command(args: list[str] | None = None) -> int:
     """Run interactive remote selector or apply arguments."""
+    parent_pid = find_mc_pid() or os.getppid()
     all_remotes_info = get_all_remotes_info()
     if not all_remotes_info:
         sys.stderr.write("Error: No remotes found in rclone.conf\n")
@@ -579,7 +624,7 @@ def select_command(args: list[str] | None = None) -> int:
         if invalid:
             sys.stderr.write(f"Error: Unknown remotes: {', '.join(invalid)}\n")
             return 1
-        return start_with_remotes(args)
+        return start_with_remotes(args, parent_pid=parent_pid)
 
     # Interactive UI
     if not sys.stdin.isatty():
@@ -594,7 +639,7 @@ def select_command(args: list[str] | None = None) -> int:
         if chosen is None:
             print("Selection cancelled.")
             return 0
-        return start_with_remotes(chosen)
+        return start_with_remotes(chosen, parent_pid=parent_pid)
     except Exception as e:
         sys.stderr.write(f"UI error: {e}\n")
         return 1
