@@ -25,13 +25,47 @@ def get_real_home():
     return os.path.expanduser("~")
 
 
-REAL_HOME = get_real_home()
-CACHE_DIR = Path(REAL_HOME) / ".cache" / "mc" / "rclone"
-PID_FILE = CACHE_DIR / "bridge.pid"
-LOG_FILE = CACHE_DIR / "bridge.log"
+def get_xdg_config_home() -> Path:
+    val = os.environ.get("XDG_CONFIG_HOME")
+    if val:
+        return Path(val).expanduser()
+    return Path(get_real_home()) / ".config"
 
-CONFIG_DIR = Path(REAL_HOME) / ".config" / "mc-rclone"
-CONFIG_FILE = CONFIG_DIR / "config.ini"
+
+def get_xdg_cache_home() -> Path:
+    val = os.environ.get("XDG_CACHE_HOME")
+    if val:
+        return Path(val).expanduser()
+    return Path(get_real_home()) / ".cache"
+
+
+def get_config_dir() -> Path:
+    return get_xdg_config_home() / "mc-rclone"
+
+
+def get_config_file() -> Path:
+    return get_config_dir() / "config.ini"
+
+
+def get_cache_dir() -> Path:
+    return get_xdg_cache_home() / "mc" / "rclone"
+
+
+def get_pid_file() -> Path:
+    return get_cache_dir() / "bridge.pid"
+
+
+def get_log_file() -> Path:
+    return get_cache_dir() / "bridge.log"
+
+
+REAL_HOME = get_real_home()
+CACHE_DIR = get_cache_dir()
+PID_FILE = get_pid_file()
+LOG_FILE = get_log_file()
+
+CONFIG_DIR = get_config_dir()
+CONFIG_FILE = get_config_file()
 
 DEFAULT_CONFIG_CONTENT = """# mc-rclone configuration file
 
@@ -74,8 +108,10 @@ DEFAULTS = {
 }
 
 
-def load_or_create_config(config_path: Path = CONFIG_FILE) -> dict:
+def load_or_create_config(config_path: Path | None = None) -> dict:
     """Load config from path or generate default file if missing."""
+    if config_path is None:
+        config_path = get_config_file()
     if not config_path.exists():
         try:
             config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,13 +139,14 @@ def load_or_create_config(config_path: Path = CONFIG_FILE) -> dict:
 
 def find_rclone_conf() -> str:
     candidates = [
-        os.path.join(REAL_HOME, ".config", "rclone", "rclone.conf"),
-        os.path.expanduser("~/.config/rclone/rclone.conf"),
+        get_xdg_config_home() / "rclone" / "rclone.conf",
+        Path(get_real_home()) / ".config" / "rclone" / "rclone.conf",
+        Path.home() / ".config" / "rclone" / "rclone.conf",
     ]
     for p in candidates:
-        if os.path.isfile(p):
-            return p
-    return candidates[0]
+        if p.is_file():
+            return str(p)
+    return str(candidates[0])
 
 
 def is_port_open(host: str, port: int) -> bool:
@@ -170,8 +207,21 @@ def find_mc_pid() -> int | None:
     return None
 
 
+def resolve_remote_type_and_config(parser: configparser.ConfigParser, sec: str) -> tuple[str, configparser.SectionProxy]:
+    """Resolve aliases recursively to find the underlying remote type and config."""
+    visited = set()
+    curr = sec
+    while curr in parser.sections() and parser[curr].get("type") == "alias" and curr not in visited:
+        visited.add(curr)
+        target = parser[curr].get("remote", "").strip()
+        curr = target.split(":")[0]
+    target_sec = curr if curr in parser.sections() else sec
+    section_proxy = parser[target_sec]
+    return section_proxy.get("type", ""), section_proxy
+
+
 def get_remotes(sftp_timeout: float = 0.2) -> list[str]:
-    """Extract configured remotes. For SFTP remotes, probes port to avoid combine startup crashes."""
+    """Extract configured remotes. For SFTP remotes (including aliases), probes port to avoid combine startup crashes."""
     conf_path = find_rclone_conf()
     if not os.path.isfile(conf_path):
         return []
@@ -185,10 +235,10 @@ def get_remotes(sftp_timeout: float = 0.2) -> list[str]:
     for sec in parser.sections():
         if sec.startswith("_"):
             continue
-        rtype = parser[sec].get("type", "")
+        rtype, target_conf = resolve_remote_type_and_config(parser, sec)
         if rtype == "sftp":
-            host = parser[sec].get("host", "")
-            port = int(parser[sec].get("port", 22))
+            host = target_conf.get("host", "")
+            port = int(target_conf.get("port", 22))
             try:
                 s = socket.socket()
                 s.settimeout(sftp_timeout)
@@ -221,9 +271,10 @@ def build_rclone_cmd(cfg: dict, upstreams: str, rclone_bin: str = "rclone", conf
 
 
 def stop() -> int:
-    if PID_FILE.is_file():
+    pid_file = get_pid_file()
+    if pid_file.is_file():
         try:
-            pid = int(PID_FILE.read_text().strip())
+            pid = int(pid_file.read_text().strip())
             if is_pid_alive(pid):
                 os.kill(pid, signal.SIGTERM)
                 for _ in range(25):
@@ -235,7 +286,7 @@ def stop() -> int:
         except Exception:
             pass
         try:
-            PID_FILE.unlink(missing_ok=True)
+            pid_file.unlink(missing_ok=True)
         except Exception:
             pass
     print("mc-rclone stopped.")
@@ -246,9 +297,10 @@ def status() -> int:
     cfg = load_or_create_config()
     addr = cfg["bind_address"]
     port = cfg["port"]
-    if PID_FILE.is_file():
+    pid_file = get_pid_file()
+    if pid_file.is_file():
         try:
-            pid = int(PID_FILE.read_text().strip())
+            pid = int(pid_file.read_text().strip())
             if is_pid_alive(pid) and is_port_open(addr, port):
                 print(f"mc-rclone is running (PID {pid}, listening on {addr}:{port}).")
                 return 0
@@ -262,8 +314,11 @@ def start(parent_pid: int | None = None) -> int:
     cfg = load_or_create_config()
     addr = cfg["bind_address"]
     port = cfg["port"]
+    cache_dir = get_cache_dir()
+    pid_file = get_pid_file()
+    log_file = get_log_file()
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     if is_port_open(addr, port):
         print(f"mc-rclone is already running on {addr}:{port}.")
         return 0
@@ -287,8 +342,8 @@ import subprocess, time, os, sys, signal
 
 parent_pid = {parent_pid}
 cmd = {cmd!r}
-pid_file = {str(PID_FILE)!r}
-log_file = {str(LOG_FILE)!r}
+pid_file = {str(pid_file)!r}
+log_file = {str(log_file)!r}
 
 def count_mc():
     try:
@@ -340,7 +395,7 @@ with open(log_file, "a") as log:
         start_new_session=True,
     )
 
-    for _ in range(40):
+    for _ in range(80):
         time.sleep(0.1)
         if is_port_open(addr, port):
             print(f"mc-rclone started successfully on {addr}:{port}.")

@@ -9,16 +9,20 @@ else
     TARGET_HOME="${HOME}"
 fi
 
-TARGET_SCRIPTS_DIR="${TARGET_HOME}/.local/share/mc/scripts"
+TARGET_CONFIG_HOME="${XDG_CONFIG_HOME:-${TARGET_HOME}/.config}"
+TARGET_DATA_HOME="${XDG_DATA_HOME:-${TARGET_HOME}/.local/share}"
+TARGET_CACHE_HOME="${XDG_CACHE_HOME:-${TARGET_HOME}/.cache}"
+
+TARGET_SCRIPTS_DIR="${TARGET_DATA_HOME}/mc/scripts"
 TARGET_BIN_DIR="${TARGET_HOME}/.local/bin"
 SCRIPT_LINK="${TARGET_SCRIPTS_DIR}/mc-rclone"
 OLD_BRIDGE_LINK="${TARGET_SCRIPTS_DIR}/mc-rclone-bridge"
 BIN_LINK="${TARGET_BIN_DIR}/mc-rclone"
-TARGET_EXTFS_DIR="${TARGET_HOME}/.local/share/mc/extfs.d"
+TARGET_EXTFS_DIR="${TARGET_DATA_HOME}/mc/extfs.d"
 OLD_EXTFS_LINK="${TARGET_EXTFS_DIR}/rclone+"
-CACHE_DIR="${TARGET_HOME}/.cache/mc/rclone"
-MENU_FILE="${TARGET_HOME}/.config/mc/menu"
-HOTLIST_FILE="${TARGET_HOME}/.config/mc/hotlist"
+CACHE_DIR="${TARGET_CACHE_HOME}/mc/rclone"
+MENU_FILE="${TARGET_CONFIG_HOME}/mc/menu"
+HOTLIST_FILE="${TARGET_CONFIG_HOME}/mc/hotlist"
 
 echo "==> Uninstalling mc-rclone..."
 

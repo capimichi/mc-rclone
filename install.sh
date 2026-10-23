@@ -10,14 +10,17 @@ else
     TARGET_HOME="${HOME}"
 fi
 
-TARGET_SCRIPTS_DIR="${TARGET_HOME}/.local/share/mc/scripts"
+TARGET_CONFIG_HOME="${XDG_CONFIG_HOME:-${TARGET_HOME}/.config}"
+TARGET_DATA_HOME="${XDG_DATA_HOME:-${TARGET_HOME}/.local/share}"
+
+TARGET_SCRIPTS_DIR="${TARGET_DATA_HOME}/mc/scripts"
 TARGET_BIN_DIR="${TARGET_HOME}/.local/bin"
 SCRIPT_LINK="${TARGET_SCRIPTS_DIR}/mc-rclone"
 BIN_LINK="${TARGET_BIN_DIR}/mc-rclone"
-CONFIG_DIR="${TARGET_HOME}/.config/mc-rclone"
+CONFIG_DIR="${TARGET_CONFIG_HOME}/mc-rclone"
 CONFIG_FILE="${CONFIG_DIR}/config.ini"
-MENU_FILE="${TARGET_HOME}/.config/mc/menu"
-HOTLIST_FILE="${TARGET_HOME}/.config/mc/hotlist"
+MENU_FILE="${TARGET_CONFIG_HOME}/mc/menu"
+HOTLIST_FILE="${TARGET_CONFIG_HOME}/mc/hotlist"
 
 echo "==> Installing mc-rclone for GNU Midnight Commander..."
 

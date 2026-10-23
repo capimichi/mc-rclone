@@ -48,7 +48,12 @@ What `install.sh` does:
 
 ## ⚙️ Configuration
 
-`mc-rclone` is configured via `~/.config/mc-rclone/config.ini` (standard XDG location). Sensible defaults are automatically created on first run:
+`mc-rclone` follows the **XDG Base Directory Specification**:
+- **Config**: `$XDG_CONFIG_HOME/mc-rclone/config.ini` (defaults to `~/.config/mc-rclone/config.ini`).
+- **Data / Scripts**: `$XDG_DATA_HOME/mc/scripts/mc-rclone` (defaults to `~/.local/share/mc/scripts/mc-rclone`).
+- **Cache / Runtime**: `$XDG_CACHE_HOME/mc/rclone/` (defaults to `~/.cache/mc/rclone/`).
+
+Sensible defaults are automatically created on first run:
 
 ```ini
 [server]

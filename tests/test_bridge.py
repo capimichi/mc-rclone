@@ -26,6 +26,30 @@ def ensure_stopped():
     subprocess.run([SCRIPT_PATH, "stop"], capture_output=True, text=True)
 
 
+def test_xdg_environment_variables(tmp_path, monkeypatch):
+    custom_cfg = tmp_path / "my_config"
+    custom_cache = tmp_path / "my_cache"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(custom_cfg))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(custom_cache))
+
+    mod = get_module()
+    assert mod.get_xdg_config_home() == custom_cfg
+    assert mod.get_xdg_cache_home() == custom_cache
+    assert mod.get_config_dir() == custom_cfg / "mc-rclone"
+    assert mod.get_cache_dir() == custom_cache / "mc" / "rclone"
+
+    # Verify auto-generation in custom XDG_CONFIG_HOME
+    cfg = mod.load_or_create_config()
+    assert (custom_cfg / "mc-rclone" / "config.ini").exists()
+    assert cfg["port"] == 2123
+
+    # Verify find_rclone_conf picks up custom XDG_CONFIG_HOME/rclone/rclone.conf
+    rclone_conf = custom_cfg / "rclone" / "rclone.conf"
+    rclone_conf.parent.mkdir(parents=True, exist_ok=True)
+    rclone_conf.write_text("[testremote]\ntype = drive\n")
+    assert mod.find_rclone_conf() == str(rclone_conf)
+
+
 def test_load_or_create_config_default(tmp_path):
     mod = get_module()
     cfg_file = tmp_path / "config.ini"
