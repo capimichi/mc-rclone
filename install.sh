@@ -93,10 +93,9 @@ for line in lines:
 new_content = "".join(filtered).rstrip()
 block = f"""
 # START_MC_RCLONE
-R       Start Cloud Storage (Rclone Server)
-	{script_link} start
-	echo "✓ Rclone Cloud Server started on 127.0.0.1:{port}"
-	echo "Press Ctrl + \\\\ (Hotlist) -> 'Cloud: Rclone' to browse."
+R       Select / Mount Cloud Storage (Rclone)
+	{script_link} select
+	echo "Press Ctrl + \\\\ (Hotlist) -> 'Cloud: Rclone (All Remotes)' to browse."
 	sleep 1
 
 S       Stop Cloud Storage (Rclone Server)

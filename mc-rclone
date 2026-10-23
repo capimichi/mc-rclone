@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
 mc-rclone - On-demand Rclone FTP bridge for GNU Midnight Commander.
-Supports XDG configuration, configurable VFS cache, and multi-instance MC watchdog.
+Features:
+- Interactive remote selector (scale-proof for 150+ remotes)
+- Multi-instance MC support with shared active pool
+- Granular on-demand mounting (zero unnecessary connections or fail2ban risk)
+- Configurable VFS cache & XDG Base Directory specification compliance
 """
 
 import sys
 import os
 import time
+import json
 import socket
 import subprocess
 import configparser
 import shutil
 import signal
+import curses
 from pathlib import Path
 
 
-def get_real_home():
+def get_real_home() -> str:
     if os.environ.get("MC_RCLONE_HOME"):
         return os.environ["MC_RCLONE_HOME"]
     home = os.environ.get("HOME", "")
@@ -25,12 +31,27 @@ def get_real_home():
     return os.path.expanduser("~")
 
 
+def get_xdg_config_home() -> Path:
+    val = os.environ.get("XDG_CONFIG_HOME")
+    if val:
+        return Path(val).expanduser()
+    return Path(get_real_home()) / ".config"
+
+
+def get_xdg_cache_home() -> Path:
+    val = os.environ.get("XDG_CACHE_HOME")
+    if val:
+        return Path(val).expanduser()
+    return Path(get_real_home()) / ".cache"
+
+
 REAL_HOME = get_real_home()
-CACHE_DIR = Path(REAL_HOME) / ".cache" / "mc" / "rclone"
+CACHE_DIR = get_xdg_cache_home() / "mc" / "rclone"
 PID_FILE = CACHE_DIR / "bridge.pid"
 LOG_FILE = CACHE_DIR / "bridge.log"
+ACTIVE_REMOTES_FILE = CACHE_DIR / "active_remotes.json"
 
-CONFIG_DIR = Path(REAL_HOME) / ".config" / "mc-rclone"
+CONFIG_DIR = get_xdg_config_home() / "mc-rclone"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
 
 DEFAULT_CONFIG_CONTENT = """# mc-rclone configuration file
@@ -74,8 +95,10 @@ DEFAULTS = {
 }
 
 
-def load_or_create_config(config_path: Path = CONFIG_FILE) -> dict:
+def load_or_create_config(config_path: Path | None = None) -> dict:
     """Load config from path or generate default file if missing."""
+    if config_path is None:
+        config_path = CONFIG_FILE
     if not config_path.exists():
         try:
             config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,13 +126,14 @@ def load_or_create_config(config_path: Path = CONFIG_FILE) -> dict:
 
 def find_rclone_conf() -> str:
     candidates = [
-        os.path.join(REAL_HOME, ".config", "rclone", "rclone.conf"),
-        os.path.expanduser("~/.config/rclone/rclone.conf"),
+        get_xdg_config_home() / "rclone" / "rclone.conf",
+        Path(get_real_home()) / ".config" / "rclone" / "rclone.conf",
+        Path.home() / ".config" / "rclone" / "rclone.conf",
     ]
     for p in candidates:
-        if os.path.isfile(p):
-            return p
-    return candidates[0]
+        if p.is_file():
+            return str(p)
+    return str(candidates[0])
 
 
 def is_port_open(host: str, port: int) -> bool:
@@ -148,30 +172,42 @@ def count_user_mc_instances() -> int:
         return 1
 
 
-def find_mc_pid() -> int | None:
-    curr = os.getpid()
-    while curr > 1:
+def get_active_remotes() -> list[str]:
+    """Read list of currently active remotes from state file."""
+    if ACTIVE_REMOTES_FILE.is_file():
         try:
-            out = subprocess.check_output(
-                ["ps", "-o", "ppid=", "-o", "comm=", "-p", str(curr)],
-                text=True
-            ).strip()
-            parts = out.split(None, 1)
-            if not parts:
-                break
-            ppid = int(parts[0])
-            comm = parts[1] if len(parts) > 1 else ""
-            base = os.path.basename(comm).lower()
-            if base in ("mc", "midnight-commander", "mc.real"):
-                return curr
-            curr = ppid
+            data = json.loads(ACTIVE_REMOTES_FILE.read_text())
+            if isinstance(data, list):
+                return data
         except Exception:
-            break
-    return None
+            pass
+    return []
 
 
-def get_remotes(sftp_timeout: float = 0.2) -> list[str]:
-    """Extract configured remotes. For SFTP remotes, probes port to avoid combine startup crashes."""
+def save_active_remotes(remotes: list[str]):
+    """Persist active remotes list to state file."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        ACTIVE_REMOTES_FILE.write_text(json.dumps(sorted(list(set(remotes))), indent=2))
+    except Exception:
+        pass
+
+
+def resolve_remote_type_and_config(parser: configparser.ConfigParser, sec: str) -> tuple[str, configparser.SectionProxy]:
+    """Resolve aliases recursively to find the underlying remote type and config."""
+    visited = set()
+    curr = sec
+    while curr in parser.sections() and parser[curr].get("type") == "alias" and curr not in visited:
+        visited.add(curr)
+        target = parser[curr].get("remote", "").strip()
+        curr = target.split(":")[0]
+    target_sec = curr if curr in parser.sections() else sec
+    section_proxy = parser[target_sec]
+    return section_proxy.get("type", "unknown"), section_proxy
+
+
+def get_all_remotes_info() -> list[tuple[str, str]]:
+    """Return sorted list of (remote_name, description) for all configured remotes."""
     conf_path = find_rclone_conf()
     if not os.path.isfile(conf_path):
         return []
@@ -181,26 +217,69 @@ def get_remotes(sftp_timeout: float = 0.2) -> list[str]:
     except Exception:
         return []
 
-    active_remotes = []
+    results = []
     for sec in parser.sections():
         if sec.startswith("_"):
             continue
-        rtype = parser[sec].get("type", "")
-        if rtype == "sftp":
-            host = parser[sec].get("host", "")
-            port = int(parser[sec].get("port", 22))
-            try:
-                s = socket.socket()
-                s.settimeout(sftp_timeout)
-                if s.connect_ex((host, port)) == 0:
-                    active_remotes.append(sec)
-                s.close()
-            except Exception:
-                pass
+        raw_type = parser[sec].get("type", "unknown")
+        real_type, real_conf = resolve_remote_type_and_config(parser, sec)
+        if raw_type == "alias":
+            target = parser[sec].get("remote", "")
+            desc = f"alias -> {target}"
+        elif real_type == "sftp":
+            host = real_conf.get("host", "")
+            port = real_conf.get("port", "22")
+            desc = f"sftp: {host}:{port}"
+        elif real_type == "ftp":
+            host = real_conf.get("host", "")
+            desc = f"ftp: {host}"
         else:
-            active_remotes.append(sec)
+            desc = real_type
+        results.append((sec, desc))
 
-    return active_remotes
+    return sorted(results, key=lambda x: x[0].lower())
+
+
+def probe_remote(sec: str, sftp_timeout: float = 0.2) -> bool:
+    """Probe network remotes (SFTP/FTP) to ensure reachability before mounting."""
+    conf_path = find_rclone_conf()
+    if not os.path.isfile(conf_path):
+        return True
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(conf_path)
+    except Exception:
+        return True
+
+    if sec not in parser.sections():
+        return False
+
+    real_type, real_conf = resolve_remote_type_and_config(parser, sec)
+    if real_type == "sftp":
+        host = real_conf.get("host", "")
+        port = int(real_conf.get("port", 22))
+        try:
+            s = socket.socket()
+            s.settimeout(sftp_timeout)
+            ok = (s.connect_ex((host, port)) == 0)
+            s.close()
+            return ok
+        except Exception:
+            return False
+    elif real_type == "ftp":
+        host = real_conf.get("host", "")
+        port = int(real_conf.get("port", 21))
+        try:
+            s = socket.socket()
+            s.settimeout(sftp_timeout)
+            ok = (s.connect_ex((host, port)) == 0)
+            s.close()
+            return ok
+        except Exception:
+            return False
+
+    # Cloud providers (drive, dropbox, onedrive, s3, etc.) are always treated as reachable
+    return True
 
 
 def build_rclone_cmd(cfg: dict, upstreams: str, rclone_bin: str = "rclone", conf_path: str = None) -> list[str]:
@@ -221,6 +300,7 @@ def build_rclone_cmd(cfg: dict, upstreams: str, rclone_bin: str = "rclone", conf
 
 
 def stop() -> int:
+    """Stop the FTP bridge server and reset active remotes."""
     if PID_FILE.is_file():
         try:
             pid = int(PID_FILE.read_text().strip())
@@ -234,23 +314,31 @@ def stop() -> int:
                     os.kill(pid, signal.SIGKILL)
         except Exception:
             pass
-        try:
-            PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
-    print("mc-rclone stopped.")
+        PID_FILE.unlink(missing_ok=True)
+
+    if ACTIVE_REMOTES_FILE.is_file():
+        ACTIVE_REMOTES_FILE.unlink(missing_ok=True)
+
+    print("mc-rclone stopped. All remotes unmounted.")
     return 0
 
 
 def status() -> int:
+    """Print current server status and active remotes."""
     cfg = load_or_create_config()
     addr = cfg["bind_address"]
     port = cfg["port"]
+    active = get_active_remotes()
+
     if PID_FILE.is_file():
         try:
             pid = int(PID_FILE.read_text().strip())
             if is_pid_alive(pid) and is_port_open(addr, port):
                 print(f"mc-rclone is running (PID {pid}, listening on {addr}:{port}).")
+                if active:
+                    print(f"Active remotes ({len(active)}): {', '.join(active)}")
+                else:
+                    print("Active remotes: none")
                 return 0
         except Exception:
             pass
@@ -258,29 +346,50 @@ def status() -> int:
     return 1
 
 
-def start(parent_pid: int | None = None) -> int:
+def start_with_remotes(selected_remotes: list[str], parent_pid: int | None = None) -> int:
+    """Start or hot-reload rclone FTP server with the specified active remotes."""
     cfg = load_or_create_config()
     addr = cfg["bind_address"]
     port = cfg["port"]
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    if is_port_open(addr, port):
-        print(f"mc-rclone is already running on {addr}:{port}.")
+
+    if not selected_remotes:
+        # If no remotes selected, stop server
+        stop()
         return 0
 
-    if parent_pid is None or parent_pid <= 1:
-        parent_pid = find_mc_pid() or os.getppid()
+    # Probe each selected remote
+    valid_remotes = []
+    for r in selected_remotes:
+        if probe_remote(r, sftp_timeout=cfg["sftp_probe_timeout"]):
+            valid_remotes.append(r)
+        else:
+            sys.stderr.write(f"Warning: Remote '{r}' is currently unreachable (skipped).\n")
 
-    remotes = get_remotes(sftp_timeout=cfg["sftp_probe_timeout"])
-    if not remotes:
-        sys.stderr.write("Error: No active remotes found in rclone.conf\n")
+    if not valid_remotes:
+        sys.stderr.write("Error: None of the selected remotes are currently reachable.\n")
         return 1
 
-    upstreams = " ".join([f"{r}={r}:" for r in remotes])
+    save_active_remotes(valid_remotes)
+    upstreams = " ".join([f"{r}={r}:" for r in valid_remotes])
     rclone_bin = shutil.which("rclone") or "/opt/homebrew/bin/rclone"
     conf_path = find_rclone_conf()
-
     cmd = build_rclone_cmd(cfg, upstreams, rclone_bin=rclone_bin, conf_path=conf_path)
+
+    # Check if server already running
+    if PID_FILE.is_file():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            if is_pid_alive(old_pid):
+                # Hot-reload: stop old process and spawn updated one
+                os.kill(old_pid, signal.SIGTERM)
+                for _ in range(20):
+                    time.sleep(0.05)
+                    if not is_port_open(addr, port):
+                        break
+        except Exception:
+            pass
 
     daemon_code = f"""
 import subprocess, time, os, sys, signal
@@ -289,6 +398,7 @@ parent_pid = {parent_pid}
 cmd = {cmd!r}
 pid_file = {str(PID_FILE)!r}
 log_file = {str(LOG_FILE)!r}
+active_file = {str(ACTIVE_REMOTES_FILE)!r}
 
 def count_mc():
     try:
@@ -311,14 +421,26 @@ with open(log_file, "a") as log:
     with open(pid_file, "w") as f:
         f.write(str(proc.pid))
 
+    consecutive_zero = 0
     try:
         while True:
             time.sleep(1.5)
             if proc.poll() is not None:
                 break
-            # Multi-instance check: terminate if no user MC instances remain
-            if count_mc() == 0:
-                break
+
+            mc_count = count_mc()
+            if mc_count == 0:
+                consecutive_zero += 1
+                # Shut down if no MC process detected for 15 seconds (10 * 1.5s)
+                if consecutive_zero >= 10:
+                    if os.path.isfile(active_file):
+                        try:
+                            os.remove(active_file)
+                        except Exception:
+                            pass
+                    break
+            else:
+                consecutive_zero = 0
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -328,7 +450,9 @@ with open(log_file, "a") as log:
                 proc.kill()
         if os.path.isfile(pid_file):
             try:
-                os.remove(pid_file)
+                with open(pid_file, "r") as pf:
+                    if pf.read().strip() == str(proc.pid):
+                        os.remove(pid_file)
             except Exception:
                 pass
 """
@@ -340,31 +464,189 @@ with open(log_file, "a") as log:
         start_new_session=True,
     )
 
-    for _ in range(40):
+    for _ in range(80):
         time.sleep(0.1)
         if is_port_open(addr, port):
-            print(f"mc-rclone started successfully on {addr}:{port}.")
+            print(f"✓ mc-rclone active on {addr}:{port} with: {', '.join(valid_remotes)}")
             return 0
 
     sys.stderr.write("Error: Timed out waiting for FTP server to listen.\n")
     return 1
 
 
+def curses_checklist_ui(stdscr, remotes_info: list[tuple[str, str]], active_set: set[str]) -> list[str] | None:
+    """Full-screen curses checklist picker with live filtering."""
+    curses.curs_set(0)
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)   # Cursor
+        curses.init_pair(2, curses.COLOR_GREEN, -1)                  # Active checkbox
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)                 # Type tag
+
+    selected = set(active_set)
+    idx = 0
+    query = ""
+
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+
+        # Title and Instructions
+        title = " mc-rclone: Select Cloud Remotes to Mount "
+        stdscr.addstr(0, max(0, (w - len(title)) // 2), title, curses.A_BOLD)
+        help_bar = "UP/DOWN: Navigate | SPACE: Toggle | ENTER: Confirm | q/ESC: Cancel"
+        stdscr.addstr(1, max(0, (w - len(help_bar)) // 2), help_bar, curses.A_DIM)
+
+        # Filter Prompt
+        prompt = f"Filter ({len(remotes_info)} remotes): {query}_"
+        stdscr.addstr(3, 2, prompt, curses.A_BOLD)
+
+        # Filter remotes based on query
+        filtered = [
+            (name, desc) for name, desc in remotes_info
+            if query.lower() in name.lower() or query.lower() in desc.lower()
+        ]
+        if idx >= len(filtered):
+            idx = max(0, len(filtered) - 1)
+
+        # Render rows
+        max_rows = h - 6
+        start_row = max(0, idx - max_rows // 2)
+        end_row = min(len(filtered), start_row + max_rows)
+
+        for i in range(start_row, end_row):
+            name, desc = filtered[i]
+            is_active = name in selected
+            box = "[X]" if is_active else "[ ]"
+            row_y = 5 + (i - start_row)
+
+            line_prefix = f" {box} {name} "
+            desc_str = f"({desc})"
+            avail_w = w - 4
+
+            full_line = f"{line_prefix}{desc_str}"[:avail_w].ljust(avail_w)
+
+            attr = curses.A_NORMAL
+            if i == idx:
+                attr = curses.color_pair(1) | curses.A_BOLD
+            elif is_active:
+                attr = curses.color_pair(2) | curses.A_BOLD
+
+            stdscr.addstr(row_y, 2, full_line, attr)
+
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (27, ord('q')):  # ESC or q
+            return None
+        elif key in (curses.KEY_UP, ord('k')):
+            if idx > 0:
+                idx -= 1
+        elif key in (curses.KEY_DOWN, ord('j')):
+            if idx < len(filtered) - 1:
+                idx += 1
+        elif key == ord(' '):  # SPACE toggles checkbox
+            if filtered:
+                curr_name = filtered[idx][0]
+                if curr_name in selected:
+                    selected.remove(curr_name)
+                else:
+                    selected.add(curr_name)
+        elif key in (10, 13, curses.KEY_ENTER):  # ENTER confirms
+            return list(selected)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            query = query[:-1]
+            idx = 0
+        elif 32 <= key <= 126:
+            query += chr(key)
+            idx = 0
+
+
+def select_command(args: list[str] | None = None) -> int:
+    """Run interactive remote selector or apply arguments."""
+    all_remotes_info = get_all_remotes_info()
+    if not all_remotes_info:
+        sys.stderr.write("Error: No remotes found in rclone.conf\n")
+        return 1
+
+    all_names = {name for name, _ in all_remotes_info}
+    active_now = get_active_remotes()
+
+    # If arguments supplied via CLI, use them directly
+    if args:
+        invalid = [a for a in args if a not in all_names]
+        if invalid:
+            sys.stderr.write(f"Error: Unknown remotes: {', '.join(invalid)}\n")
+            return 1
+        return start_with_remotes(args)
+
+    # Interactive UI
+    if not sys.stdin.isatty():
+        sys.stderr.write("Non-interactive terminal: specify remotes as arguments.\n")
+        print("Available remotes:")
+        for name, desc in all_remotes_info:
+            print(f"  {name} ({desc})")
+        return 1
+
+    try:
+        chosen = curses.wrapper(curses_checklist_ui, all_remotes_info, set(active_now))
+        if chosen is None:
+            print("Selection cancelled.")
+            return 0
+        return start_with_remotes(chosen)
+    except Exception as e:
+        sys.stderr.write(f"UI error: {e}\n")
+        return 1
+
+
+def add_command(remotes: list[str]) -> int:
+    """Add remotes to currently active set."""
+    if not remotes:
+        sys.stderr.write("Usage: mc-rclone add <remote1> [remote2 ...]\n")
+        return 1
+    current = set(get_active_remotes())
+    current.update(remotes)
+    return start_with_remotes(list(current))
+
+
+def remove_command(remotes: list[str]) -> int:
+    """Remove remotes from currently active set."""
+    if not remotes:
+        sys.stderr.write("Usage: mc-rclone remove <remote1> [remote2 ...]\n")
+        return 1
+    current = set(get_active_remotes())
+    current.difference_update(remotes)
+    return start_with_remotes(list(current))
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: mc-rclone {start [mc_pid]|stop|status}")
-        sys.exit(1)
+        # Default behavior when invoked without arguments: open selector
+        sys.exit(select_command())
 
     cmd = sys.argv[1].lower()
-    if cmd == "start":
-        parent_pid = int(sys.argv[2]) if len(sys.argv) > 2 else None
-        sys.exit(start(parent_pid))
+    if cmd == "select":
+        sys.exit(select_command(sys.argv[2:] if len(sys.argv) > 2 else None))
+    elif cmd == "start":
+        # If remotes already active, start them; otherwise open selector
+        active = get_active_remotes()
+        parent_pid = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
+        if active:
+            sys.exit(start_with_remotes(active, parent_pid=parent_pid))
+        else:
+            sys.exit(select_command())
+    elif cmd == "add":
+        sys.exit(add_command(sys.argv[2:]))
+    elif cmd == "remove":
+        sys.exit(remove_command(sys.argv[2:]))
     elif cmd == "stop":
         sys.exit(stop())
     elif cmd == "status":
         sys.exit(status())
     else:
         print(f"Unknown command: {cmd}")
+        print("Usage: mc-rclone {select|start|add|remove|stop|status}")
         sys.exit(1)
 
 

@@ -18,7 +18,7 @@ test -x "$TEST_SANDBOX/.local/share/mc/scripts/mc-rclone"
 test -f "$TEST_SANDBOX/.config/mc-rclone/config.ini"
 
 # 3. Verify menu contains shortcuts
-grep -q "mc-rclone start" "$TEST_SANDBOX/.config/mc/menu"
+grep -q "mc-rclone select" "$TEST_SANDBOX/.config/mc/menu"
 grep -q "mc-rclone stop" "$TEST_SANDBOX/.config/mc/menu"
 grep -q "mc-rclone status" "$TEST_SANDBOX/.config/mc/menu"
 

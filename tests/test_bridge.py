@@ -26,6 +26,21 @@ def ensure_stopped():
     subprocess.run([SCRIPT_PATH, "stop"], capture_output=True, text=True)
 
 
+def test_xdg_environment_variables(tmp_path, monkeypatch):
+    custom_cfg = tmp_path / "my_config"
+    custom_cache = tmp_path / "my_cache"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(custom_cfg))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(custom_cache))
+
+    mod = get_module()
+    assert mod.get_xdg_config_home() == custom_cfg
+    assert mod.get_xdg_cache_home() == custom_cache
+
+    cfg = mod.load_or_create_config()
+    assert (custom_cfg / "mc-rclone" / "config.ini").exists()
+    assert cfg["port"] == 2123
+
+
 def test_load_or_create_config_default(tmp_path):
     mod = get_module()
     cfg_file = tmp_path / "config.ini"
@@ -98,32 +113,60 @@ def test_count_user_mc_instances(monkeypatch):
     assert mod.count_user_mc_instances() == 0
 
 
+def test_get_all_remotes_info():
+    mod = get_module()
+    remotes = mod.get_all_remotes_info()
+    assert len(remotes) > 0
+    names = [name for name, _ in remotes]
+    assert "googledrive-capimichi" in names
+
+
 def test_bridge_status_when_stopped():
     res = subprocess.run([SCRIPT_PATH, "status"], capture_output=True, text=True)
     assert res.returncode in (0, 1)
     assert "stopped" in res.stdout.lower() or "not running" in res.stdout.lower()
 
 
-def test_bridge_start_and_stop():
-    my_pid = str(os.getpid())
-    res = subprocess.run([SCRIPT_PATH, "start", my_pid], capture_output=True, text=True)
+def test_select_add_remove_and_stop():
+    # 1. Start server with googledrive
+    res = subprocess.run([SCRIPT_PATH, "select", "googledrive-capimichi"], capture_output=True, text=True)
     assert res.returncode == 0
+    assert "googledrive-capimichi" in res.stdout
 
-    time.sleep(0.5)
+    time.sleep(0.4)
+    # Check status
     res_status = subprocess.run([SCRIPT_PATH, "status"], capture_output=True, text=True)
     assert "running" in res_status.stdout.lower()
+    assert "googledrive-capimichi" in res_status.stdout
 
-    # Read port from config or default 2123
+    # Verify FTP port responds
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(2)
-    conn_result = sock.connect_ex(("127.0.0.1", 2123))
+    assert sock.connect_ex(("127.0.0.1", 2123)) == 0
     sock.close()
-    assert conn_result == 0
 
-    # Stop bridge
+    # 2. Hot-add dropbox
+    res_add = subprocess.run([SCRIPT_PATH, "add", "dropbox-michele"], capture_output=True, text=True)
+    assert res_add.returncode == 0
+    time.sleep(0.4)
+
+    res_status2 = subprocess.run([SCRIPT_PATH, "status"], capture_output=True, text=True)
+    assert "googledrive-capimichi" in res_status2.stdout
+    assert "dropbox-michele" in res_status2.stdout
+
+    # 3. Hot-remove googledrive
+    res_rem = subprocess.run([SCRIPT_PATH, "remove", "googledrive-capimichi"], capture_output=True, text=True)
+    assert res_rem.returncode == 0
+    time.sleep(0.4)
+
+    res_status3 = subprocess.run([SCRIPT_PATH, "status"], capture_output=True, text=True)
+    assert "googledrive-capimichi" not in res_status3.stdout
+    assert "dropbox-michele" in res_status3.stdout
+
+    # 4. Stop bridge
     res_stop = subprocess.run([SCRIPT_PATH, "stop"], capture_output=True, text=True)
     assert res_stop.returncode == 0
-    time.sleep(0.5)
+    time.sleep(0.4)
 
     res_after = subprocess.run([SCRIPT_PATH, "status"], capture_output=True, text=True)
-    assert "stopped" in res_after.stdout.lower() or "not running" in res_after.stdout.lower()
+    assert "stopped" in res_after.stdout.lower()

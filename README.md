@@ -89,18 +89,49 @@ sftp_probe_timeout = 0.2
    ```bash
    mc
    ```
-2. **Start Cloud Server (F2 -> R):**
-   * Press **`F2`** (User Menu), then press **`R`** (*Start Cloud Storage (Rclone Server)*).
-   * The local Rclone bridge starts in background (~0.2s) listening on `127.0.0.1:2123`.
+2. **Select & Mount Remotes (F2 -> R):**
+   * Press **`F2`** (User Menu), then select **`R`** (*Select / Mount Cloud Storage*).
+   * A full-screen interactive picker opens with real-time filtering:
+     - Use **`UP` / `DOWN`** to navigate.
+     - Type any letters to search across 150+ remotes instantly.
+     - Press **`SPACE`** to toggle `[X]` / `[ ]` on remotes.
+     - Press **`ENTER`** to mount selected remotes.
+   * Rclone starts or hot-reloads in **~0.3s** on `127.0.0.1:2123`.
 3. **Browse Cloud Remotes (Ctrl + \\):**
    * Press **`Ctrl + \`** (Directory Hotlist) and select **`Cloud: Rclone (All Remotes)`**.
-   * Your active panel instantly displays all your configured cloud remotes.
-4. **On-Demand Deep Browsing:**
-   * Press **Enter** on any remote or subfolder to browse live on-demand.
-   * Full file management supported: **`F3`** (View), **`F5`** (Copy across panels or locally), **`F7`** (Mkdir), **`F8`** (Delete).
+   * Your active panel displays whatever remotes you currently have active.
+4. **Multi-Window Shared Pool:**
+   * Open as many MC windows or tmux panes as you want.
+   * If you press **`F2 -> R`** in another window, simply toggle additional remotes to add them to the shared pool. Press **`Ctrl + R`** to refresh any open panel.
 5. **Clean Exit:**
    * When you quit Midnight Commander (**`F10`**), the background server terminates automatically once the last `mc` window closes.
-   * You can also check status with **`F2` -> `?`** or stop it manually anytime with **`F2` -> `S`**.
+   * You can also check status with **`F2` -> `?`** or unmount/stop manually anytime with **`F2` -> `S`**.
+
+---
+
+### Command Line Interface (CLI)
+
+You can also manage active remotes directly from your terminal:
+
+```bash
+# Open interactive curses remote selector
+mc-rclone select
+
+# Directly mount specific remotes without UI
+mc-rclone select googledrive-capimichi dropbox-michele
+
+# Hot-add a remote to the active pool
+mc-rclone add onedrive-michele
+
+# Hot-remove a remote from the active pool
+mc-rclone remove googledrive-capimichi
+
+# Check server status and active remotes
+mc-rclone status
+
+# Stop server and unmount all remotes
+mc-rclone stop
+```
 
 ---
 
