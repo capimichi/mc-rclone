@@ -35,6 +35,8 @@ mkdir -p "${TARGET_SCRIPTS_DIR}" "${TARGET_BIN_DIR}"
 chmod +x "${SCRIPT_DIR}/mc-rclone"
 ln -sf "${SCRIPT_DIR}/mc-rclone" "${SCRIPT_LINK}"
 ln -sf "${SCRIPT_DIR}/mc-rclone" "${BIN_LINK}"
+# Clean legacy links and obsolete configs from older versions
+rm -f "${TARGET_SCRIPTS_DIR}/mc-rclone-bridge" "${TARGET_HOME}/.local/share/mc/extfs.d/rclone+" "${CONFIG_DIR}/last_remotes.json"
 echo "✓ Installed mc-rclone to ${SCRIPT_LINK} and ${BIN_LINK}"
 
 # 3. Initialize configuration file if missing
