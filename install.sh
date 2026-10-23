@@ -95,7 +95,7 @@ block = f"""
 # START_MC_RCLONE
 R       Select / Mount Cloud Storage (Rclone)
 	{script_link} select
-	echo "Press Ctrl + \\\\ (Hotlist) -> 'Cloud: Rclone (All Remotes)' to browse."
+	echo "Press Ctrl + \\\\ (Hotlist) to browse active cloud drives."
 	sleep 1
 
 S       Stop Cloud Storage (Rclone Server)
@@ -113,29 +113,33 @@ with open(menu_path, "w") as f:
 EOF
 echo "✓ Configured User Menu entry in ${MENU_FILE} (F2 -> R / S / ?)"
 
-# 5. Configure Directory Hotlist (~/.config/mc/hotlist)
+# 5. Clean obsolete Hotlist entries (~/.config/mc/hotlist)
 mkdir -p "$(dirname "${HOTLIST_FILE}")"
 touch "${HOTLIST_FILE}"
 python3 - <<'EOF'
 import os
 hl_path = os.path.expanduser(os.environ.get("HOTLIST_FILE", "~/.config/mc/hotlist"))
-port = os.environ.get("PORT", "2123")
 lines = []
 if os.path.isfile(hl_path):
     with open(hl_path, "r") as f:
         lines = f.readlines()
-# Remove old /#rclone+ or duplicate entries
-filtered = [l for l in lines if "/#rclone+" not in l and "127.0.0.1:" not in l]
-filtered.append(f'ENTRY "Cloud: Rclone (All Remotes)" URL "ftp://127.0.0.1:{port}"\n')
+# Remove old /#rclone+, obsolete combine entries, or stale 127.0.0.1:212* lines
+filtered = [
+    l for l in lines
+    if "/#rclone+" not in l
+    and "Cloud: Rclone (All Remotes)" not in l
+    and "127.0.0.1:212" not in l
+]
 with open(hl_path, "w") as f:
     f.writelines(filtered)
 EOF
-echo "✓ Configured Hotlist bookmark 'Cloud: Rclone (All Remotes)' (port ${PORT})"
+echo "✓ Cleaned legacy entries in ${HOTLIST_FILE} (active drives are injected dynamically)"
 
 echo ""
 echo "==> Installation complete!"
 echo "How to use:"
 echo "  1. Launch Midnight Commander: mc"
-echo "  2. Press F2 (User Menu) and select 'R' (Start Cloud Storage)"
-echo "  3. Press Ctrl + \\ (Hotlist) and select 'Cloud: Rclone (All Remotes)'"
-echo "  4. Deep navigation across subfolders is instant and on-demand."
+echo "  2. Press F2 (User Menu) and select 'R' (Select / Mount Cloud Storage)"
+echo "  3. Pick desired remote(s) with [Space] and confirm with [Enter]"
+echo "  4. Press Ctrl + \\ (Hotlist) to browse any active 'Cloud: <remote>' drive"
+echo "  5. Each remote runs on an independent port (zero socket drops, zero hangs)."

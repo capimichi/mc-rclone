@@ -8,14 +8,15 @@ Browse, copy, view, and manage files across any cloud storage supported by Rclon
 
 ## ✨ Features
 
-- **On-Demand Deep Navigation (`:combine:` Backend)**: No initial scan freeze ("minute zero"). The root directory instantly exposes all remotes, and subdirectories are fetched live on-demand with infinite depth.
+- **Independent Multi-Instance Ports**: Each selected remote runs as an isolated Rclone FTP server on its own dedicated loopback port (e.g., `2123`, `2124`...). Hot-adding or removing drives never restarts active servers, ensuring zero TCP socket drops and eliminating Midnight Commander `?` stat errors.
+- **Dynamic Hotlist Injection**: Active remotes automatically appear directly in Midnight Commander's Directory Hotlist (`Ctrl + \`). Midnight Commander detects the hotlist file `mtime` modification on-the-fly, reloading active cloud bookmarks instantly without restarting `mc`.
+- **Zero Startup Hangs**: SFTP/SSH probe prevents unreachable hosts from blocking startup. Remotes launch independently in parallel in ~0.05s.
 - **Configurable VFS Cache**: Native support for Rclone's VFS caching (`writes` or `full`), cache size limits, eviction age, and directory cache times via standard XDG configuration (`~/.config/mc-rclone/config.ini`).
-- **Multi-Instance Support**: Open multiple `mc` terminal windows or tmux panes simultaneously; the shared local server stays active as long as any user `mc` instance is running, shutting down only when the last `mc` window closes.
+- **Multi-Instance Support**: Open multiple `mc` terminal windows or tmux panes simultaneously; active servers remain available until the last `mc` window closes.
 - **Zero Persistent Daemons**: No `launchd`, no `systemd`, no sentinels, no open ports, and zero memory overhead when MC is closed.
 - **Untouched MC Binary**: Your system `mc` binary remains 100% original. No wrappers, aliases, or binary replacements.
 - **Dual-Pane Cloud-to-Cloud Transfers**: Open Google Drive on the left panel and Dropbox on the right panel, and copy files directly with `F5`.
 - **Full File Management**: Supports viewing (`F3`), downloading/copying (`F5`), deleting (`F8`), and creating directories (`F7`).
-- **Offline Remote Resilience**: Rapid pre-check probes SFTP/SSH remotes; unreachable or offline remotes are automatically skipped so `:combine:` starts instantly without hanging.
 - **100% Portable**: Compatible with macOS (Apple Silicon & Intel), Linux (Debian, Ubuntu, Arch, Fedora, Alpine), and BSD.
 
 ---
@@ -52,11 +53,11 @@ What `install.sh` does:
 
 ```ini
 [server]
-# Local IP address to bind the FTP server (loopback for security)
+# Base IP address to bind the FTP servers (loopback for security)
 bind_address = 127.0.0.1
 
-# Local FTP port used by rclone and configured in Midnight Commander hotlist
-port = 2123
+# Starting port for independent FTP instances (each active remote gets an incremental port)
+base_port = 2123
 
 [vfs]
 # VFS cache mode: off | minimal | writes | full
@@ -98,11 +99,13 @@ sftp_probe_timeout = 0.2
      - Press **`ENTER`** to mount selected remotes.
    * Rclone starts or hot-reloads in **~0.3s** on `127.0.0.1:2123`.
 3. **Browse Cloud Remotes (Ctrl + \\):**
-   * Press **`Ctrl + \`** (Directory Hotlist) and select **`Cloud: Rclone (All Remotes)`**.
-   * Your active panel displays whatever remotes you currently have active.
-4. **Multi-Window Shared Pool:**
+   * Press **`Ctrl + \`** (Directory Hotlist) and select any active remote (e.g. **`Cloud: googledrive-capimichi`**).
+   * Midnight Commander reloads the hotlist instantly upon keypress—no MC restart required.
+   * Your active panel connects directly to the dedicated port with full subfolder navigation.
+4. **Multi-Window Shared Pool & Dynamic Addition:**
    * Open as many MC windows or tmux panes as you want.
-   * If you press **`F2 -> R`** in another window, simply toggle additional remotes to add them to the shared pool. Press **`Ctrl + R`** to refresh any open panel.
+   * If you press **`F2 -> R`** in another window or at any later time, simply toggle additional remotes.
+   * New remotes start on separate ports immediately; previously opened drives are never interrupted or severed!
 5. **Clean Exit:**
    * When you quit Midnight Commander (**`F10`**), the background server terminates automatically once the last `mc` window closes.
    * You can also check status with **`F2` -> `?`** or unmount/stop manually anytime with **`F2` -> `S`**.

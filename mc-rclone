@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-mc-rclone - On-demand Rclone FTP bridge for GNU Midnight Commander.
-Features:
-- Interactive remote selector (scale-proof for 150+ remotes)
-- Multi-instance MC support with shared active pool
-- Granular on-demand mounting (zero unnecessary connections or fail2ban risk)
-- Configurable VFS cache & XDG Base Directory specification compliance
+mc-rclone - Independent On-Demand Rclone FTP Bridge for GNU Midnight Commander.
+Architecture:
+- Each selected remote runs an isolated Rclone FTP instance on a dedicated loopback port.
+- Active remotes are dynamically injected into MC's Directory Hotlist (~/.config/mc/hotlist).
+- MC reloads the hotlist instantly upon pressing Ctrl + \\ (native stat mtime reload).
+- Completely eliminates socket drops, combine overhead, and cross-remote interference.
+- Central watchdog cleanly terminates all active servers and cleans the hotlist on MC exit.
 """
 
 import sys
@@ -47,21 +48,21 @@ def get_xdg_cache_home() -> Path:
 
 REAL_HOME = get_real_home()
 CACHE_DIR = get_xdg_cache_home() / "mc" / "rclone"
-PID_FILE = CACHE_DIR / "bridge.pid"
-LOG_FILE = CACHE_DIR / "bridge.log"
-ACTIVE_REMOTES_FILE = CACHE_DIR / "active_remotes.json"
+ACTIVE_INSTANCES_FILE = CACHE_DIR / "active_instances.json"
+WATCHDOG_PID_FILE = CACHE_DIR / "watchdog.pid"
 
 CONFIG_DIR = get_xdg_config_home() / "mc-rclone"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
+DEFAULT_REMOTES_FILE = CONFIG_DIR / "default_remotes.json"
 
 DEFAULT_CONFIG_CONTENT = """# mc-rclone configuration file
 
 [server]
-# Local IP address to bind the FTP server (loopback for security)
+# Base IP address to bind the FTP servers (loopback for security)
 bind_address = 127.0.0.1
 
-# Local FTP port used by rclone and configured in Midnight Commander hotlist
-port = 2123
+# Starting port for independent FTP instances (each active remote gets an incremental port)
+base_port = 2123
 
 [vfs]
 # VFS cache mode: off | minimal | writes | full
@@ -80,12 +81,12 @@ dir_cache_time = 5m
 
 [network]
 # Socket connection timeout in seconds for probing SFTP/SSH remotes
-# Unreachable or offline remotes are automatically skipped to prevent rclone hangs
 sftp_probe_timeout = 0.2
 """
 
 DEFAULTS = {
     "bind_address": "127.0.0.1",
+    "base_port": 2123,
     "port": 2123,
     "cache_mode": "writes",
     "cache_max_size": "10G",
@@ -113,9 +114,11 @@ def load_or_create_config(config_path: Path | None = None) -> dict:
     except Exception:
         return DEFAULTS.copy()
 
+    base_p = parser.getint("server", "base_port", fallback=parser.getint("server", "port", fallback=DEFAULTS["base_port"]))
     return {
         "bind_address": parser.get("server", "bind_address", fallback=DEFAULTS["bind_address"]),
-        "port": parser.getint("server", "port", fallback=DEFAULTS["port"]),
+        "base_port": base_p,
+        "port": base_p,
         "cache_mode": parser.get("vfs", "cache_mode", fallback=DEFAULTS["cache_mode"]),
         "cache_max_size": parser.get("vfs", "cache_max_size", fallback=DEFAULTS["cache_max_size"]),
         "cache_max_age": parser.get("vfs", "cache_max_age", fallback=DEFAULTS["cache_max_age"]),
@@ -136,9 +139,13 @@ def find_rclone_conf() -> str:
     return str(candidates[0])
 
 
+def get_hotlist_path() -> Path:
+    return get_xdg_config_home() / "mc" / "hotlist"
+
+
 def is_port_open(host: str, port: int) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.3)
+    sock.settimeout(0.2)
     try:
         res = sock.connect_ex((host, port))
         return res == 0
@@ -146,15 +153,14 @@ def is_port_open(host: str, port: int) -> bool:
         sock.close()
 
 
-def is_pid_alive(pid: int) -> bool:
+def is_pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 1:
+        return False
     try:
         os.kill(pid, 0)
         return True
     except (OSError, ProcessLookupError):
         return False
-
-
-LAST_REMOTES_FILE = CONFIG_DIR / "last_remotes.json"
 
 
 def count_user_mc_instances() -> int:
@@ -198,18 +204,37 @@ def find_mc_pid() -> int | None:
     return None
 
 
-def get_active_remotes() -> list[str]:
-    """Read list of currently active remotes from state file or last saved selection."""
-    if ACTIVE_REMOTES_FILE.is_file():
+def get_active_instances() -> dict:
+    """Read dictionary of currently active remote instances: {remote: {port, pid}}."""
+    if ACTIVE_INSTANCES_FILE.is_file():
         try:
-            data = json.loads(ACTIVE_REMOTES_FILE.read_text())
-            if isinstance(data, list) and data:
-                return data
+            data = json.loads(ACTIVE_INSTANCES_FILE.read_text())
+            if isinstance(data, dict):
+                # Filter out stale/dead processes
+                live = {}
+                for rem, info in data.items():
+                    if is_pid_alive(info.get("pid")):
+                        live[rem] = info
+                return live
         except Exception:
             pass
-    if LAST_REMOTES_FILE.is_file():
+    return {}
+
+
+def save_active_instances(instances: dict):
+    """Persist active instances to state file."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        ACTIVE_INSTANCES_FILE.write_text(json.dumps(instances, indent=2))
+    except Exception:
+        pass
+
+
+def get_default_remotes() -> list[str]:
+    """Get last saved remote preferences."""
+    if DEFAULT_REMOTES_FILE.is_file():
         try:
-            data = json.loads(LAST_REMOTES_FILE.read_text())
+            data = json.loads(DEFAULT_REMOTES_FILE.read_text())
             if isinstance(data, list):
                 return data
         except Exception:
@@ -217,15 +242,10 @@ def get_active_remotes() -> list[str]:
     return []
 
 
-def save_active_remotes(remotes: list[str]):
-    """Persist active remotes list to state file and remember as default selection."""
+def save_default_remotes(remotes: list[str]):
     try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        content = json.dumps(sorted(list(set(remotes))), indent=2)
-        ACTIVE_REMOTES_FILE.write_text(content)
-        if remotes:
-            LAST_REMOTES_FILE.write_text(content)
+        DEFAULT_REMOTES_FILE.write_text(json.dumps(sorted(list(set(remotes))), indent=2))
     except Exception:
         pass
 
@@ -319,203 +339,296 @@ def probe_remote(sec: str, sftp_timeout: float = 0.2) -> bool:
     return True
 
 
-def build_rclone_cmd(cfg: dict, upstreams: str, rclone_bin: str = "rclone", conf_path: str = None) -> list[str]:
-    cmd = [rclone_bin]
-    if conf_path:
-        cmd.extend(["--config", conf_path])
-    cmd.extend([
-        "serve", "ftp",
-        "--addr", f"{cfg['bind_address']}:{cfg['port']}",
-        "--vfs-cache-mode", cfg["cache_mode"],
-        "--vfs-cache-max-size", cfg["cache_max_size"],
-        "--vfs-cache-max-age", cfg["cache_max_age"],
-        "--dir-cache-time", cfg["dir_cache_time"],
-        "--combine-upstreams", upstreams,
-        ":combine:",
-    ])
-    return cmd
+def allocate_port(instances: dict, base_port: int, bind_addr: str) -> int:
+    """Find the next available port for a new remote instance."""
+    used_ports = {info["port"] for info in instances.values() if "port" in info}
+    candidate = base_port
+    while True:
+        if candidate not in used_ports and not is_port_open(bind_addr, candidate):
+            return candidate
+        candidate += 1
 
 
-def stop() -> int:
-    """Stop the FTP bridge server and reset active remotes."""
-    if PID_FILE.is_file():
+def sync_hotlist(instances: dict):
+    """Dynamically update ~/.config/mc/hotlist with currently active remotes and touch mtime."""
+    hotlist_path = get_hotlist_path()
+    if not hotlist_path.parent.is_dir():
+        hotlist_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = []
+    if hotlist_path.is_file():
         try:
-            pid = int(PID_FILE.read_text().strip())
-            if is_pid_alive(pid):
-                os.kill(pid, signal.SIGTERM)
-                for _ in range(25):
-                    time.sleep(0.1)
-                    if not is_pid_alive(pid):
-                        break
-                if is_pid_alive(pid):
-                    os.kill(pid, signal.SIGKILL)
+            lines = hotlist_path.read_text().splitlines(keepends=True)
         except Exception:
-            pass
-        PID_FILE.unlink(missing_ok=True)
+            lines = []
 
-    if ACTIVE_REMOTES_FILE.is_file():
-        ACTIVE_REMOTES_FILE.unlink(missing_ok=True)
+    # Filter out existing Cloud: entries and 127.0.0.1:212* lines
+    filtered = [
+        l for l in lines
+        if not (l.strip().startswith('ENTRY "Cloud:') or '127.0.0.1:212' in l)
+    ]
 
-    print("mc-rclone stopped. All remotes unmounted.")
-    return 0
+    # Append current live instances
+    for rem in sorted(instances.keys()):
+        port = instances[rem]["port"]
+        filtered.append(f'ENTRY "Cloud: {rem}" URL "ftp://127.0.0.1:{port}"\n')
+
+    try:
+        hotlist_path.write_text("".join(filtered))
+        # Touch file to force MC's stat() to detect mtime update immediately
+        os.utime(hotlist_path, None)
+    except Exception as e:
+        sys.stderr.write(f"Warning: Could not update hotlist: {e}\n")
 
 
-def status() -> int:
-    """Print current server status and active remotes."""
-    cfg = load_or_create_config()
-    addr = cfg["bind_address"]
-    port = cfg["port"]
-    active = get_active_remotes()
-
-    if PID_FILE.is_file():
+def ensure_watchdog(parent_mc_pid: int | None = None):
+    """Ensure the background watchdog supervisor is running."""
+    if WATCHDOG_PID_FILE.is_file():
         try:
-            pid = int(PID_FILE.read_text().strip())
-            if is_pid_alive(pid) and is_port_open(addr, port):
-                print(f"mc-rclone is running (PID {pid}, listening on {addr}:{port}).")
-                if active:
-                    print(f"Active remotes ({len(active)}): {', '.join(active)}")
-                else:
-                    print("Active remotes: none")
-                return 0
-        except Exception:
-            pass
-    print("mc-rclone is stopped.")
-    return 1
-
-
-def start_with_remotes(selected_remotes: list[str], parent_pid: int | None = None) -> int:
-    """Start or hot-reload rclone FTP server with the specified active remotes."""
-    cfg = load_or_create_config()
-    addr = cfg["bind_address"]
-    port = cfg["port"]
-
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not selected_remotes:
-        # If no remotes selected, stop server
-        stop()
-        return 0
-
-    if parent_pid is None or parent_pid <= 1:
-        parent_pid = find_mc_pid()
-
-    # Probe each selected remote
-    valid_remotes = []
-    for r in selected_remotes:
-        if probe_remote(r, sftp_timeout=cfg["sftp_probe_timeout"]):
-            valid_remotes.append(r)
-        else:
-            sys.stderr.write(f"Warning: Remote '{r}' is currently unreachable (skipped).\n")
-
-    if not valid_remotes:
-        sys.stderr.write("Error: None of the selected remotes are currently reachable.\n")
-        return 1
-
-    # Check if server is already running with the exact same remotes
-    active_now = get_active_remotes()
-    if PID_FILE.is_file():
-        try:
-            old_pid = int(PID_FILE.read_text().strip())
-            if is_pid_alive(old_pid) and is_port_open(addr, port):
-                if set(valid_remotes) == set(active_now):
-                    print(f"✓ mc-rclone is already running on {addr}:{port} with: {', '.join(valid_remotes)}")
-                    return 0
-                # Remotes changed: notify user about hot-reload
-                print("ℹ Remotes changed: reloading Rclone server...")
-                os.kill(old_pid, signal.SIGTERM)
-                for _ in range(20):
-                    time.sleep(0.05)
-                    if not is_port_open(addr, port):
-                        break
+            wpid = int(WATCHDOG_PID_FILE.read_text().strip())
+            if is_pid_alive(wpid):
+                return
         except Exception:
             pass
 
-    save_active_remotes(valid_remotes)
-    upstreams = " ".join([f"{r}={r}:" for r in valid_remotes])
-    rclone_bin = shutil.which("rclone") or "/opt/homebrew/bin/rclone"
-    conf_path = find_rclone_conf()
-    cmd = build_rclone_cmd(cfg, upstreams, rclone_bin=rclone_bin, conf_path=conf_path)
+    watchdog_script = f"""
+import subprocess, time, os, sys, signal, json
 
-    daemon_code = f"""
-import subprocess, time, os, sys, signal
+parent_mc_pid = {parent_mc_pid}
+state_file = {str(ACTIVE_INSTANCES_FILE)!r}
+watchdog_pid_file = {str(WATCHDOG_PID_FILE)!r}
+hotlist_file = {str(get_hotlist_path())!r}
 
-parent_mc_pid = {parent_pid}
-cmd = {cmd!r}
-pid_file = {str(PID_FILE)!r}
-log_file = {str(LOG_FILE)!r}
-active_file = {str(ACTIVE_REMOTES_FILE)!r}
+with open(watchdog_pid_file, 'w') as f:
+    f.write(str(os.getpid()))
 
 def count_mc():
     try:
-        output = subprocess.check_output(
-            ["/bin/ps", "-u", str(os.getuid()), "-o", "comm="],
-            stderr=subprocess.DEVNULL,
-            text=True
-        )
-        count = 0
-        for line in output.splitlines():
-            base = os.path.basename(line.strip()).lower()
-            if base in ("mc", "midnight-commander", "mc.real"):
-                count += 1
-        return count
+        out = subprocess.check_output(['/bin/ps', '-u', str(os.getuid()), '-o', 'comm='], text=True)
+        return sum(1 for line in out.splitlines() if os.path.basename(line.strip()).lower() in ('mc', 'midnight-commander', 'mc.real'))
     except Exception:
         return 0
 
-with open(log_file, "a") as log:
-    proc = subprocess.Popen(cmd, stdout=log, stderr=log)
-    with open(pid_file, "w") as f:
-        f.write(str(proc.pid))
+def kill_all():
+    if os.path.isfile(state_file):
+        try:
+            with open(state_file) as sf:
+                data = json.load(sf)
+            for info in data.values():
+                pid = info.get('pid')
+                if pid:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        try:
+            os.remove(state_file)
+        except Exception:
+            pass
 
-    try:
-        while True:
-            time.sleep(0.5)
-            if proc.poll() is not None:
+    # Clean hotlist entries
+    if os.path.isfile(hotlist_file):
+        try:
+            with open(hotlist_file, 'r') as hf:
+                lines = hf.readlines()
+            filtered = [l for l in lines if not (l.strip().startswith('ENTRY "Cloud:') or '127.0.0.1:212' in l)]
+            with open(hotlist_file, 'w') as hf:
+                hf.writelines(filtered)
+            os.utime(hotlist_file, None)
+        except Exception:
+            pass
+
+try:
+    while True:
+        time.sleep(0.5)
+        if not os.path.isfile(state_file):
+            break
+
+        # If launched from MC, monitor its parent PID
+        if parent_mc_pid and parent_mc_pid > 1:
+            try:
+                os.kill(parent_mc_pid, 0)
+            except (OSError, ProcessLookupError):
+                if count_mc() == 0:
+                    break
+        else:
+            # Standalone mode: exit if no MC running for 2 seconds
+            if count_mc() == 0:
                 break
-
-            # If launched from within Midnight Commander, track its lifetime
-            if parent_mc_pid and parent_mc_pid > 1:
-                try:
-                    os.kill(parent_mc_pid, 0)
-                except (OSError, ProcessLookupError):
-                    # Parent MC died: verify if any other MC instance is running
-                    if count_mc() == 0:
-                        if os.path.isfile(active_file):
-                            try:
-                                os.remove(active_file)
-                            except Exception:
-                                pass
-                        break
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        if os.path.isfile(pid_file):
-            try:
-                with open(pid_file, "r") as pf:
-                    if pf.read().strip() == str(proc.pid):
-                        os.remove(pid_file)
-            except Exception:
-                pass
+finally:
+    kill_all()
+    if os.path.isfile(watchdog_pid_file):
+        try:
+            os.remove(watchdog_pid_file)
+        except Exception:
+            pass
 """
     subprocess.Popen(
-        [sys.executable, "-c", daemon_code],
+        [sys.executable, "-c", watchdog_script],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
-    for _ in range(80):
-        time.sleep(0.1)
-        if is_port_open(addr, port):
-            print(f"✓ mc-rclone active on {addr}:{port} with: {', '.join(valid_remotes)}")
-            return 0
 
-    sys.stderr.write("Error: Timed out waiting for FTP server to listen.\n")
-    return 1
+def build_single_rclone_cmd(
+    remote: str,
+    port: int,
+    cfg: dict,
+    rclone_bin: str = "rclone",
+    conf_path: str | None = None
+) -> list[str]:
+    """Construct argument list for isolated rclone serve ftp process."""
+    cmd = [rclone_bin]
+    if conf_path:
+        cmd.extend(["--config", conf_path])
+    cmd.extend([
+        "serve", "ftp",
+        f"{remote}:",
+        "--addr", f"{cfg['bind_address']}:{port}",
+        "--vfs-cache-mode", cfg["cache_mode"],
+        "--vfs-cache-max-size", cfg["cache_max_size"],
+        "--vfs-cache-max-age", cfg["cache_max_age"],
+        "--dir-cache-time", cfg["dir_cache_time"],
+    ])
+    return cmd
+
+
+def start_single_instance(remote: str, port: int, cfg: dict) -> int | None:
+    """Spawn an isolated Rclone FTP server for a single remote."""
+    rclone_bin = shutil.which("rclone") or "/opt/homebrew/bin/rclone"
+    conf_path = find_rclone_conf()
+    log_file = CACHE_DIR / f"rclone_{remote}.log"
+
+    cmd = build_single_rclone_cmd(remote, port, cfg, rclone_bin=rclone_bin, conf_path=conf_path)
+
+    with open(log_file, "a") as log:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=log,
+            start_new_session=True
+        )
+
+    for _ in range(50):
+        time.sleep(0.05)
+        if is_port_open(cfg["bind_address"], port):
+            return proc.pid
+
+    # Failed to bind
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    return None
+
+
+def apply_remotes(target_remotes: list[str], parent_pid: int | None = None) -> int:
+    """Synchronize running servers with target remotes list."""
+    cfg = load_or_create_config()
+    addr = cfg["bind_address"]
+    base_port = cfg["base_port"]
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    current_instances = get_active_instances()
+    target_set = set(target_remotes)
+
+    if parent_pid is None or parent_pid <= 1:
+        parent_pid = find_mc_pid()
+
+    # 1. Stop any running instances that were deselected
+    to_remove = [rem for rem in current_instances if rem not in target_set]
+    for rem in to_remove:
+        pid = current_instances[rem].get("pid")
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        del current_instances[rem]
+
+    # 2. Start newly selected remotes
+    to_add = [rem for rem in target_remotes if rem not in current_instances]
+    for rem in to_add:
+        # Probe remote
+        if not probe_remote(rem, sftp_timeout=cfg["sftp_probe_timeout"]):
+            sys.stderr.write(f"Warning: Remote '{rem}' is currently unreachable (skipped).\n")
+            continue
+
+        port = allocate_port(current_instances, base_port, addr)
+        pid = start_single_instance(rem, port, cfg)
+        if pid:
+            current_instances[rem] = {
+                "port": port,
+                "pid": pid,
+                "remote": rem,
+            }
+        else:
+            sys.stderr.write(f"Error: Failed to start server for '{rem}' on port {port}.\n")
+
+    save_active_instances(current_instances)
+    if target_remotes:
+        save_default_remotes(target_remotes)
+
+    # 3. Update hotlist and watchdog
+    sync_hotlist(current_instances)
+
+    if current_instances:
+        ensure_watchdog(parent_pid)
+        print("✓ Active cloud remotes:")
+        for rem, info in sorted(current_instances.items()):
+            print(f"  • {rem} -> ftp://{addr}:{info['port']}")
+        print("Press Ctrl + \\ (Hotlist) in MC to open.")
+    else:
+        print("All cloud remotes unmounted.")
+
+    return 0
+
+
+def stop_all() -> int:
+    """Stop all running remote instances and clean state."""
+    instances = get_active_instances()
+    for rem, info in instances.items():
+        pid = info.get("pid")
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    if ACTIVE_INSTANCES_FILE.is_file():
+        ACTIVE_INSTANCES_FILE.unlink(missing_ok=True)
+
+    if WATCHDOG_PID_FILE.is_file():
+        try:
+            wpid = int(WATCHDOG_PID_FILE.read_text().strip())
+            os.kill(wpid, signal.SIGTERM)
+        except Exception:
+            pass
+        WATCHDOG_PID_FILE.unlink(missing_ok=True)
+
+    sync_hotlist({})
+    print("mc-rclone stopped. All cloud remotes unmounted.")
+    return 0
+
+
+def status() -> int:
+    """Show status of all running instances."""
+    instances = get_active_instances()
+    cfg = load_or_create_config()
+    addr = cfg["bind_address"]
+
+    if instances:
+        print(f"mc-rclone is running ({len(instances)} active remotes):")
+        for rem, info in sorted(instances.items()):
+            print(f"  • {rem:25} listening on ftp://{addr}:{info['port']} (PID {info['pid']})")
+        return 0
+    else:
+        print("mc-rclone is stopped (no active cloud remotes).")
+        return 1
 
 
 def curses_checklist_ui(stdscr, remotes_info: list[tuple[str, str]], active_set: set[str]) -> list[str] | None:
@@ -616,7 +729,10 @@ def select_command(args: list[str] | None = None) -> int:
         return 1
 
     all_names = {name for name, _ in all_remotes_info}
-    active_now = get_active_remotes()
+    active_instances = get_active_instances()
+    active_now = list(active_instances.keys())
+    if not active_now:
+        active_now = get_default_remotes()
 
     # If arguments supplied via CLI, use them directly
     if args:
@@ -624,7 +740,7 @@ def select_command(args: list[str] | None = None) -> int:
         if invalid:
             sys.stderr.write(f"Error: Unknown remotes: {', '.join(invalid)}\n")
             return 1
-        return start_with_remotes(args, parent_pid=parent_pid)
+        return apply_remotes(args, parent_pid=parent_pid)
 
     # Interactive UI
     if not sys.stdin.isatty():
@@ -639,30 +755,30 @@ def select_command(args: list[str] | None = None) -> int:
         if chosen is None:
             print("Selection cancelled.")
             return 0
-        return start_with_remotes(chosen, parent_pid=parent_pid)
+        return apply_remotes(chosen, parent_pid=parent_pid)
     except Exception as e:
         sys.stderr.write(f"UI error: {e}\n")
         return 1
 
 
 def add_command(remotes: list[str]) -> int:
-    """Add remotes to currently active set."""
+    """Add remotes to active set."""
     if not remotes:
         sys.stderr.write("Usage: mc-rclone add <remote1> [remote2 ...]\n")
         return 1
-    current = set(get_active_remotes())
+    current = set(get_active_instances().keys())
     current.update(remotes)
-    return start_with_remotes(list(current))
+    return apply_remotes(list(current))
 
 
 def remove_command(remotes: list[str]) -> int:
-    """Remove remotes from currently active set."""
+    """Remove remotes from active set."""
     if not remotes:
         sys.stderr.write("Usage: mc-rclone remove <remote1> [remote2 ...]\n")
         return 1
-    current = set(get_active_remotes())
+    current = set(get_active_instances().keys())
     current.difference_update(remotes)
-    return start_with_remotes(list(current))
+    return apply_remotes(list(current))
 
 
 def main():
@@ -674,11 +790,11 @@ def main():
     if cmd == "select":
         sys.exit(select_command(sys.argv[2:] if len(sys.argv) > 2 else None))
     elif cmd == "start":
-        # If remotes already active, start them; otherwise open selector
-        active = get_active_remotes()
+        # Start with default/active remotes, or open selector if none
+        active = list(get_active_instances().keys()) or get_default_remotes()
         parent_pid = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
         if active:
-            sys.exit(start_with_remotes(active, parent_pid=parent_pid))
+            sys.exit(apply_remotes(active, parent_pid=parent_pid))
         else:
             sys.exit(select_command())
     elif cmd == "add":
@@ -686,7 +802,7 @@ def main():
     elif cmd == "remove":
         sys.exit(remove_command(sys.argv[2:]))
     elif cmd == "stop":
-        sys.exit(stop())
+        sys.exit(stop_all())
     elif cmd == "status":
         sys.exit(status())
     else:

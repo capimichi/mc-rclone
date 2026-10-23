@@ -80,28 +80,59 @@ sftp_probe_timeout = 0.5
     assert cfg["sftp_probe_timeout"] == 0.5
 
 
-def test_build_rclone_cmd():
+def test_build_single_rclone_cmd():
     mod = get_module()
     cfg = {
         "bind_address": "127.0.0.1",
-        "port": 2123,
+        "base_port": 2123,
         "cache_mode": "writes",
         "cache_max_size": "10G",
         "cache_max_age": "24h",
         "dir_cache_time": "5m",
         "sftp_probe_timeout": 0.2,
     }
-    cmd = mod.build_rclone_cmd(cfg, "rem1=rem1: rem2=rem2:")
+    cmd = mod.build_single_rclone_cmd("mydrive", 2124, cfg, rclone_bin="rclone", conf_path="/etc/rclone.conf")
     assert cmd == [
-        "rclone", "serve", "ftp",
-        "--addr", "127.0.0.1:2123",
+        "rclone", "--config", "/etc/rclone.conf",
+        "serve", "ftp",
+        "mydrive:",
+        "--addr", "127.0.0.1:2124",
         "--vfs-cache-mode", "writes",
         "--vfs-cache-max-size", "10G",
         "--vfs-cache-max-age", "24h",
         "--dir-cache-time", "5m",
-        "--combine-upstreams", "rem1=rem1: rem2=rem2:",
-        ":combine:"
     ]
+
+
+def test_dynamic_hotlist_sync_preserves_bookmarks(tmp_path, monkeypatch):
+    custom_cfg = tmp_path / "config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(custom_cfg))
+    mod = get_module()
+
+    hotlist_file = mod.get_hotlist_path()
+    hotlist_file.parent.mkdir(parents=True, exist_ok=True)
+    hotlist_file.write_text('ENTRY "/var/log" URL "/var/log"\nENTRY "My Home" URL "/Users/michele"\n')
+
+    instances = {
+        "googledrive": {"port": 2123, "pid": 1111},
+        "dropbox": {"port": 2124, "pid": 2222},
+    }
+    mod.sync_hotlist(instances)
+
+    content = hotlist_file.read_text()
+    assert 'ENTRY "/var/log" URL "/var/log"' in content
+    assert 'ENTRY "My Home" URL "/Users/michele"' in content
+    assert 'ENTRY "Cloud: dropbox" URL "ftp://127.0.0.1:2124"' in content
+    assert 'ENTRY "Cloud: googledrive" URL "ftp://127.0.0.1:2123"' in content
+
+    # Deselect one instance
+    del instances["googledrive"]
+    mod.sync_hotlist(instances)
+
+    content2 = hotlist_file.read_text()
+    assert 'ENTRY "Cloud: googledrive"' not in content2
+    assert 'ENTRY "Cloud: dropbox" URL "ftp://127.0.0.1:2124"' in content2
+    assert 'ENTRY "/var/log" URL "/var/log"' in content2
 
 
 def test_count_user_mc_instances(monkeypatch):
