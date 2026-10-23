@@ -33,11 +33,14 @@ if ! command -v rclone &>/dev/null; then
     echo "Warning: 'rclone' executable not found in PATH. Make sure rclone is installed." >&2
 fi
 
-# 2. Install executable
+# 2. Install executable (copy files cleanly, replacing any old symlinks)
 mkdir -p "${TARGET_SCRIPTS_DIR}" "${TARGET_BIN_DIR}"
 chmod +x "${SCRIPT_DIR}/mc-rclone"
-ln -sf "${SCRIPT_DIR}/mc-rclone" "${SCRIPT_LINK}"
-ln -sf "${SCRIPT_DIR}/mc-rclone" "${BIN_LINK}"
+rm -f "${SCRIPT_LINK}" "${BIN_LINK}"
+cp -f "${SCRIPT_DIR}/mc-rclone" "${SCRIPT_LINK}"
+chmod +x "${SCRIPT_LINK}"
+cp -f "${SCRIPT_DIR}/mc-rclone" "${BIN_LINK}"
+chmod +x "${BIN_LINK}"
 # Clean legacy links and obsolete configs from older versions
 rm -f "${TARGET_SCRIPTS_DIR}/mc-rclone-bridge" "${TARGET_HOME}/.local/share/mc/extfs.d/rclone+" "${CONFIG_DIR}/last_remotes.json"
 echo "✓ Installed mc-rclone to ${SCRIPT_LINK} and ${BIN_LINK}"
@@ -51,28 +54,15 @@ else
     echo "✓ Existing configuration preserved in ${CONFIG_FILE}"
 fi
 
-# Determine configured port (default 2123)
-PORT=$(python3 -c "
-import configparser, os
-cfg = os.path.expanduser('${CONFIG_FILE}')
-p = 2123
-if os.path.isfile(cfg):
-    c = configparser.ConfigParser()
-    c.read(cfg)
-    p = c.getint('server', 'port', fallback=2123)
-print(p)
-")
-
 # 4. Configure User Menu (~/.config/mc/menu)
 mkdir -p "$(dirname "${MENU_FILE}")"
 touch "${MENU_FILE}"
 
-export PORT MENU_FILE SCRIPT_LINK HOTLIST_FILE
+export MENU_FILE SCRIPT_LINK HOTLIST_FILE
 python3 - <<'EOF'
 import os
 
 menu_path = os.path.expanduser(os.environ.get("MENU_FILE", "~/.config/mc/menu"))
-port = os.environ.get("PORT", "2123")
 script_link = os.path.expanduser(os.environ.get("SCRIPT_LINK", "~/.local/share/mc/scripts/mc-rclone"))
 content = ""
 if os.path.isfile(menu_path):

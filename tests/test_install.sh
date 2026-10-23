@@ -20,9 +20,13 @@ EOF
 # 1. Run install
 "$REPO_DIR/install.sh"
 
-# 2. Verify files and links
-test -L "$TEST_SANDBOX/.local/share/mc/scripts/mc-rclone"
+# 2. Verify files are copied and executable (not symlinks)
+test -f "$TEST_SANDBOX/.local/share/mc/scripts/mc-rclone"
+test ! -L "$TEST_SANDBOX/.local/share/mc/scripts/mc-rclone"
 test -x "$TEST_SANDBOX/.local/share/mc/scripts/mc-rclone"
+test -f "$TEST_SANDBOX/.local/bin/mc-rclone"
+test ! -L "$TEST_SANDBOX/.local/bin/mc-rclone"
+test -x "$TEST_SANDBOX/.local/bin/mc-rclone"
 test -f "$TEST_SANDBOX/.config/mc-rclone/config.ini"
 
 # 3. Verify menu contains shortcuts
@@ -68,7 +72,8 @@ export XDG_CACHE_HOME="$CUSTOM_CACHE"
 
 "$REPO_DIR/install.sh"
 
-test -L "$CUSTOM_DATA/mc/scripts/mc-rclone"
+test -f "$CUSTOM_DATA/mc/scripts/mc-rclone"
+test ! -L "$CUSTOM_DATA/mc/scripts/mc-rclone"
 test -x "$CUSTOM_DATA/mc/scripts/mc-rclone"
 test -f "$CUSTOM_CONFIG/mc-rclone/config.ini"
 grep -q "mc-rclone select" "$CUSTOM_CONFIG/mc/menu"
