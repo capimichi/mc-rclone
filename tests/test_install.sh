@@ -49,3 +49,41 @@ test ! -e "$TEST_SANDBOX/.local/share/mc/scripts/mc-rclone"
 ! grep -q "127.0.0.1:2123" "$TEST_SANDBOX/.config/mc/hotlist"
 
 echo "✓ Sandbox uninstall verification passed."
+
+# 7. Test with explicit custom XDG variables
+CUSTOM_CONFIG="$TEST_SANDBOX/custom_xdg_config"
+CUSTOM_DATA="$TEST_SANDBOX/custom_xdg_data"
+CUSTOM_CACHE="$TEST_SANDBOX/custom_xdg_cache"
+
+mkdir -p "$CUSTOM_CONFIG/rclone"
+cat <<'EOF' > "$CUSTOM_CONFIG/rclone/rclone.conf"
+[testremote]
+type = alias
+remote = /tmp
+EOF
+
+export XDG_CONFIG_HOME="$CUSTOM_CONFIG"
+export XDG_DATA_HOME="$CUSTOM_DATA"
+export XDG_CACHE_HOME="$CUSTOM_CACHE"
+
+"$REPO_DIR/install.sh"
+
+test -L "$CUSTOM_DATA/mc/scripts/mc-rclone"
+test -x "$CUSTOM_DATA/mc/scripts/mc-rclone"
+test -f "$CUSTOM_CONFIG/mc-rclone/config.ini"
+grep -q "mc-rclone select" "$CUSTOM_CONFIG/mc/menu"
+
+"$CUSTOM_DATA/mc/scripts/mc-rclone" select testremote
+grep -q 'ENTRY "Cloud: testremote" URL "ftp://127.0.0.1:2123"' "$CUSTOM_CONFIG/mc/hotlist"
+
+"$CUSTOM_DATA/mc/scripts/mc-rclone" stop
+! grep -q 'Cloud: testremote' "$CUSTOM_CONFIG/mc/hotlist"
+
+echo "✓ Sandbox custom XDG paths install and dynamic hotlist verification passed."
+
+"$REPO_DIR/uninstall.sh"
+
+test ! -e "$CUSTOM_DATA/mc/scripts/mc-rclone"
+! grep -q "mc-rclone" "$CUSTOM_CONFIG/mc/menu"
+
+echo "✓ Sandbox custom XDG paths uninstall verification passed."
