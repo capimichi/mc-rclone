@@ -49,7 +49,7 @@ echo "✓ Sandbox install and dynamic hotlist verification passed."
 
 # 6. Verify symlink and configs cleaned
 test ! -e "$TEST_SANDBOX/.local/share/mc/scripts/mc-rclone"
-! grep -q "mc-rclone" "$TEST_SANDBOX/.config/mc/menu"
+test ! -e "$TEST_SANDBOX/.config/mc/menu" || ! grep -q "mc-rclone" "$TEST_SANDBOX/.config/mc/menu"
 ! grep -q "127.0.0.1:2123" "$TEST_SANDBOX/.config/mc/hotlist"
 
 echo "✓ Sandbox uninstall verification passed."
@@ -89,6 +89,40 @@ echo "✓ Sandbox custom XDG paths install and dynamic hotlist verification pass
 "$REPO_DIR/uninstall.sh"
 
 test ! -e "$CUSTOM_DATA/mc/scripts/mc-rclone"
-! grep -q "mc-rclone" "$CUSTOM_CONFIG/mc/menu"
+test ! -e "$CUSTOM_CONFIG/mc/menu" || ! grep -q "mc-rclone" "$CUSTOM_CONFIG/mc/menu"
 
 echo "✓ Sandbox custom XDG paths uninstall verification passed."
+
+# 8. Missing user menu is seeded from the system menu and removed again on uninstall
+FAKE_SYS_MENU="$TEST_SANDBOX/system_mc.menu"
+printf 'shell_patterns=0\n\n+ t r\nx       Default system entry\n\techo system\n' > "$FAKE_SYS_MENU"
+export MC_RCLONE_SYSTEM_MENU="$FAKE_SYS_MENU"
+rm -f "$CUSTOM_CONFIG/mc/menu"
+
+"$REPO_DIR/install.sh"
+grep -q "Default system entry" "$CUSTOM_CONFIG/mc/menu"
+grep -q "mc-rclone select" "$CUSTOM_CONFIG/mc/menu"
+
+# Re-running install must not duplicate the block or re-seed
+"$REPO_DIR/install.sh"
+test "$(grep -c "START_MC_RCLONE" "$CUSTOM_CONFIG/mc/menu")" -eq 1
+test "$(grep -c "Default system entry" "$CUSTOM_CONFIG/mc/menu")" -eq 1
+
+"$REPO_DIR/uninstall.sh"
+test ! -e "$CUSTOM_CONFIG/mc/menu"
+test ! -e "$CUSTOM_CONFIG/mc-rclone/.menu_seeded"
+
+echo "✓ Sandbox system menu seeding verification passed."
+
+# 9. Existing user menu is kept as is (no seeding) and survives uninstall
+printf 'u       My custom entry\n\techo mine\n' > "$CUSTOM_CONFIG/mc/menu"
+
+"$REPO_DIR/install.sh"
+grep -q "My custom entry" "$CUSTOM_CONFIG/mc/menu"
+! grep -q "Default system entry" "$CUSTOM_CONFIG/mc/menu"
+
+"$REPO_DIR/uninstall.sh"
+grep -q "My custom entry" "$CUSTOM_CONFIG/mc/menu"
+! grep -q "mc-rclone" "$CUSTOM_CONFIG/mc/menu"
+
+echo "✓ Sandbox existing user menu preservation verification passed."

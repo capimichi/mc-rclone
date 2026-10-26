@@ -69,6 +69,17 @@ EOF
     echo "✓ Cleaned user menu entries in ${MENU_FILE}"
 fi
 
+# Drop the menu seeded by install.sh if untouched, so mc falls back to the system menu
+SEED_MARKER="${CONFIG_DIR}/.menu_seeded"
+if [ -f "${SEED_MARKER}" ]; then
+    SYS_MENU="$(cat "${SEED_MARKER}")"
+    if [ -f "${SYS_MENU}" ] && [ -f "${MENU_FILE}" ] && diff -qB "${SYS_MENU}" "${MENU_FILE}" >/dev/null; then
+        rm -f "${MENU_FILE}"
+        echo "✓ Removed seeded ${MENU_FILE} (system menu restored)"
+    fi
+    rm -f "${SEED_MARKER}"
+fi
+
 # 4. Clean hotlist
 if [ -f "${HOTLIST_FILE}" ]; then
     python3 - <<EOF

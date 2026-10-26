@@ -56,6 +56,27 @@ fi
 
 # 4. Configure User Menu (~/.config/mc/menu)
 mkdir -p "$(dirname "${MENU_FILE}")"
+SEED_MARKER="${CONFIG_DIR}/.menu_seeded"
+# A user menu fully replaces the system one: seed it so default F2 entries survive
+if [ ! -s "${MENU_FILE}" ]; then
+    SYS_MENU="${MC_RCLONE_SYSTEM_MENU:-}"
+    if [ -z "${SYS_MENU}" ] && command -v mc &>/dev/null; then
+        for d in $(mc -F 2>/dev/null | awk '/\[System data\]/{s=1} s && /(Config|Data) directory:/{print $3}'); do
+            if [ -f "${d%/}/mc.menu" ]; then SYS_MENU="${d%/}/mc.menu"; break; fi
+        done
+    fi
+    if [ -z "${SYS_MENU}" ]; then
+        for f in /etc/mc/mc.menu /usr/local/etc/mc/mc.menu /opt/homebrew/etc/mc/mc.menu /usr/share/mc/mc.menu; do
+            if [ -f "$f" ]; then SYS_MENU="$f"; break; fi
+        done
+    fi
+    if [ -n "${SYS_MENU}" ] && [ -f "${SYS_MENU}" ]; then
+        cp "${SYS_MENU}" "${MENU_FILE}"
+        mkdir -p "${CONFIG_DIR}"
+        echo "${SYS_MENU}" > "${SEED_MARKER}"
+        echo "✓ Seeded ${MENU_FILE} from system menu ${SYS_MENU}"
+    fi
+fi
 touch "${MENU_FILE}"
 
 export MENU_FILE SCRIPT_LINK HOTLIST_FILE
