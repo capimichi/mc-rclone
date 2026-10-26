@@ -42,7 +42,7 @@ cd mc-rclone
 What `install.sh` does:
 1. Installs `mc-rclone` into `~/.local/share/mc/scripts/mc-rclone` and `~/.local/bin/mc-rclone`.
 2. Generates default configuration `~/.config/mc-rclone/config.ini` if not already present.
-3. Adds shortcut entries to your MC User Menu (`~/.config/mc/menu`) accessible via **`F2`** (`R` to start, `S` to stop, `?` for status).
+3. Adds shortcut entries to your MC User Menu (`~/.config/mc/menu`) accessible via **`F2`** (`R` to start, `S` to stop, `?` for status). Since a user menu replaces the system one, if `~/.config/mc/menu` does not exist yet it is first seeded from the system `mc.menu`, so the default entries are kept (`uninstall.sh` removes the seeded file again if you have not edited it).
 4. Adds a bookmark to your MC Directory Hotlist (`~/.config/mc/hotlist`, `Ctrl + \`).
 
 ---
